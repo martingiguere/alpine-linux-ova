@@ -17,7 +17,9 @@
 # Optional env:
 #   OVA_DIR          — directory holding .ovf + .vmdk + .mf  (default: ./_out, then current dir)
 #   OVA_NAME         — basename of the .ovf (default: auto-detect single .ovf in OVA_DIR)
-#   ESXI_DATASTORE   — target datastore name (default: datastore1)
+#   ESXI_DATASTORE   — target datastore name, or 'auto' to pick the first one
+#                      with at least MIN_FREE_GIB free space (default: auto)
+#   MIN_FREE_GIB     — free-space threshold for ESXI_DATASTORE=auto (default: 10)
 #   ESXI_NETWORK     — port-group name for VM NIC (default: 'VM Network')
 #   TEST_VM_NAME     — VM name on ESXi (default: alpine-ova-test-<pid>)
 #   TEST_HOSTNAME    — hostname cloud-init should set; used as success signal (default: alpine-ovatest)
@@ -36,11 +38,12 @@ set -euo pipefail
 : "${ESXI_USER:?ESXI_USER must be set}"
 : "${ESXI_PASSWORD:?ESXI_PASSWORD must be set}"
 
-: "${ESXI_DATASTORE:=datastore1}"
+: "${ESXI_DATASTORE:=auto}"   # name, or 'auto' to pick first with MIN_FREE_GIB
 : "${ESXI_NETWORK:=VM Network}"
 : "${TEST_VM_NAME:=alpine-ova-test-$$}"
 : "${TEST_HOSTNAME:=alpine-ovatest}"
 : "${WAIT_SECONDS:=120}"
+: "${MIN_FREE_GIB:=10}"        # threshold for 'auto' datastore pick
 : "${GOVC_INSECURE:=1}"
 
 # OVA_DIR: prefer ./_out (where build-ova.sh writes), else current dir.
@@ -61,7 +64,7 @@ MF_FILE="$OVA_DIR/${OVA_NAME}.mf"
 
 export GOVC_URL="https://${ESXI_USER}:${ESXI_PASSWORD}@${ESXI_HOST}"
 export GOVC_INSECURE
-export GOVC_DATASTORE="$ESXI_DATASTORE"
+# GOVC_DATASTORE is set later, after auto-pick if requested.
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -93,7 +96,7 @@ command -v base64 >/dev/null 2>&1 || fail "base64 not on PATH"
 [ -f "$MF_FILE" ]  || fail "Manifest not found: $MF_FILE"
 
 log "Bundle: $OVA_DIR/${OVA_NAME}.{ovf,vmdk,mf}"
-log "Target: $ESXI_HOST (datastore=$ESXI_DATASTORE network=$ESXI_NETWORK)"
+log "Target: $ESXI_HOST (network=$ESXI_NETWORK, datastore=$ESXI_DATASTORE)"
 log "VM:     $TEST_VM_NAME (hostname=$TEST_HOSTNAME)"
 
 # ---------------------------------------------------------------------------
@@ -116,6 +119,36 @@ pass "manifest verified"
 log "Probing ESXi connectivity…"
 govc about >/dev/null || fail "govc cannot connect to $ESXI_HOST (check ESXI_HOST/USER/PASSWORD, network reachability, GOVC_INSECURE)"
 pass "connected to $ESXI_HOST"
+
+# ---------------------------------------------------------------------------
+# 3b. Datastore: explicit name, or auto-pick first with enough free space.
+# ---------------------------------------------------------------------------
+if [ "$ESXI_DATASTORE" = "auto" ]; then
+    log "Auto-selecting datastore with ≥${MIN_FREE_GIB} GiB free…"
+    min_bytes=$((MIN_FREE_GIB * 1024 * 1024 * 1024))
+    # govc ls -t Datastore returns paths like '/ha-datacenter/datastore/datastore1'.
+    # For each, govc datastore.info -json returns .Datastores[0].Info.FreeSpace (bytes).
+    picked=""; picked_free=""
+    while IFS= read -r ds_path; do
+        [ -z "$ds_path" ] && continue
+        ds_name="${ds_path##*/}"
+        free=$(govc datastore.info -json -ds="$ds_name" 2>/dev/null \
+            | jq -r 'first(..|.FreeSpace? // empty)' 2>/dev/null || echo "")
+        [ -z "$free" ] && continue
+        if [ "$free" -ge "$min_bytes" ] 2>/dev/null; then
+            picked="$ds_name"; picked_free="$free"
+            break
+        fi
+    done <<< "$(govc ls -t Datastore 'datastore/*' 2>/dev/null || govc ls -t Datastore)"
+    if [ -z "$picked" ]; then
+        log "No datastore had ≥${MIN_FREE_GIB} GiB free. Available:"
+        govc datastore.info 2>&1 | grep -E 'Name:|Free:' | sed 's/^/  /' >&2
+        fail "Set ESXI_DATASTORE=<name> explicitly, or lower MIN_FREE_GIB."
+    fi
+    ESXI_DATASTORE="$picked"
+    pass "picked datastore '$ESXI_DATASTORE' ($((picked_free / 1024 / 1024 / 1024)) GiB free)"
+fi
+export GOVC_DATASTORE="$ESXI_DATASTORE"
 
 if govc vm.info "$TEST_VM_NAME" 2>/dev/null | grep -q '^Name:'; then
     log "Removing pre-existing VM '$TEST_VM_NAME'…"
