@@ -111,3 +111,33 @@ extraConfig (set on vSphere via the OVF properties or `extra_config = {}` in
 terraform's `vsphere_virtual_machine`). Both base64 and gzip+base64 encodings
 are honored via the corresponding `.encoding` keys, which are declared as
 `ovf:userConfigurable="true"` properties in the OVF.
+
+## Testing on a real ESXi host
+
+`test-esxi.sh` uploads an OVA bundle to an ESXi host, injects cloud-init
+guestinfo, powers the VM on, and verifies that open-vm-tools reports a guest IP
+and that cloud-init applied the requested hostname (proves the VMware
+datasource is wired correctly end-to-end). Cleans up after itself.
+
+Requires `govc` and `jq` on PATH.
+
+```sh
+export ESXI_HOST=esxi.lan          # or IP
+export ESXI_USER=root
+export ESXI_PASSWORD=…
+# Optional:
+export ESXI_DATASTORE=datastore1   # default
+export ESXI_NETWORK="VM Network"   # default
+export KEEP_VM=1                   # skip cleanup if you want to inspect
+
+# Point at the .ovf bundle (auto-detects in ./_out/ or current dir)
+./test-esxi.sh
+```
+
+Pass criteria:
+1. Local manifest hashes match the actual files.
+2. govc can authenticate.
+3. OVF imports without error.
+4. VM powers on and reports a guest IP within `WAIT_SECONDS` (120s default).
+5. Guest hostname (via VMware tools) matches `TEST_HOSTNAME` — confirms the
+   VMware cloud-init datasource read guestinfo and cloud-init applied it.
