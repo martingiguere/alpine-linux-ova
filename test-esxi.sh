@@ -130,17 +130,17 @@ if [ "$ESXI_DATASTORE" = "auto" ]; then
     # govc ls -t Datastore returns paths like '/ha-datacenter/datastore/datastore1'.
     # For each, govc datastore.info -json returns .Datastores[0].Info.FreeSpace (bytes).
     picked=""; picked_free=""
-    while IFS= read -r ds_path; do
-        [ -z "$ds_path" ] && continue
-        ds_name="${ds_path##*/}"
-        free=$(govc datastore.info -json -ds="$ds_name" 2>/dev/null \
-            | jq -r 'first(..|.FreeSpace? // empty)' 2>/dev/null || echo "")
-        [ -z "$free" ] && continue
+    # govc datastore.info -json (no args) returns ALL datastores in one shot
+    # under .datastores[]; each has .info.name and .info.freeSpace (bytes).
+    # Lowercase keys — case matters in jq.
+    while IFS=$'\t' read -r ds_name free; do
+        [ -z "$ds_name" ] && continue
         if [ "$free" -ge "$min_bytes" ] 2>/dev/null; then
             picked="$ds_name"; picked_free="$free"
             break
         fi
-    done <<< "$(govc ls -t Datastore 'datastore/*' 2>/dev/null || govc ls -t Datastore)"
+    done < <(govc datastore.info -json 2>/dev/null \
+        | jq -r '.datastores[] | "\(.info.name)\t\(.info.freeSpace)"')
     if [ -z "$picked" ]; then
         log "No datastore had ≥${MIN_FREE_GIB} GiB free. Available:"
         govc datastore.info 2>&1 | grep -E 'Name:|Free:' | sed 's/^/  /' >&2
@@ -157,8 +157,9 @@ export GOVC_DATASTORE="$ESXI_DATASTORE"
 # ---------------------------------------------------------------------------
 if [ "$ESXI_NETWORK" = "auto" ]; then
     log "Auto-selecting VM network…"
-    # govc ls -t Network returns paths like '/ha-datacenter/network/VM Network'.
-    networks=$(govc ls -t Network 2>/dev/null | sed 's|.*/||' || true)
+    # `govc ls -t Network` needs an explicit path; `govc find -type n` does not.
+    # Returns paths like '/ha-datacenter/network/VM Network'.
+    networks=$(govc find -type n 2>/dev/null | sed 's|.*/||' || true)
     [ -n "$networks" ] || fail "no networks visible to govc — check ESXi permissions"
     picked_net=""
     # Preference 1: literal 'VM Network'.
