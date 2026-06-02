@@ -264,6 +264,15 @@ chmod +x "$CHROOT_SCRIPT"
 # ---------------------------------------------------------------------------
 # 3. Build the qcow2
 # ---------------------------------------------------------------------------
+# Write repos to a real file (NOT /dev/stdin — heredoc pipes don't survive
+# `sudo env`; alpine-make-vm-image's `install -m644` on the missing pipe
+# silently produces an empty image with no apk repos configured).
+REPOS_FILE="$WORK/repositories"
+cat > "$REPOS_FILE" <<EOF
+https://dl-cdn.alpinelinux.org/alpine/${ALPINE_BRANCH}/main
+https://dl-cdn.alpinelinux.org/alpine/${ALPINE_BRANCH}/community
+EOF
+
 QCOW2="$WORK/${OUTPUT_NAME}.qcow2"
 log "Building qcow2: $QCOW2 (${DISK_SIZE_GB}G, branch $ALPINE_BRANCH, arch $ARCH)"
 sudo env \
@@ -279,15 +288,20 @@ sudo env \
         --image-size "${DISK_SIZE_GB}G" \
         --kernel-flavor "$KERNEL_FLAVOR" \
         --packages "$PACKAGES" \
-        --repositories-file /dev/stdin \
+        --repositories-file "$REPOS_FILE" \
         --serial-console \
         --script-chroot \
-        "$QCOW2" "$CHROOT_SCRIPT" <<EOF
-https://dl-cdn.alpinelinux.org/alpine/${ALPINE_BRANCH}/main
-https://dl-cdn.alpinelinux.org/alpine/${ALPINE_BRANCH}/community
-EOF
+        "$QCOW2" "$CHROOT_SCRIPT"
 
 sudo chown "$(id -u):$(id -g)" "$QCOW2"
+
+# Sanity: an Alpine base + cloud-init + open-vm-tools install is ≥150 MB
+# uncompressed. Anything tiny means the install silently failed.
+QCOW_BYTES=$(qemu-img info --output=json "$QCOW2" | awk -F'[ ,:]+' '/"actual-size"/{print $3; exit}')
+MIN_BYTES=$((50 * 1024 * 1024))
+if [ "${QCOW_BYTES:-0}" -lt "$MIN_BYTES" ]; then
+    die "qcow2 actual-size is $QCOW_BYTES bytes (< 50 MB threshold) — base system install likely failed silently. Check alpine-make-vm-image output above."
+fi
 
 # ---------------------------------------------------------------------------
 # 4. Convert qcow2 -> streamOptimized VMDK
