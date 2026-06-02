@@ -128,7 +128,7 @@ export ESXI_PASSWORD=…
 # Optional:
 export ESXI_DATASTORE=auto         # default — picks first datastore with ≥10 GiB free
 export MIN_FREE_GIB=10             # threshold for ESXI_DATASTORE=auto
-export ESXI_NETWORK="VM Network"   # default
+export ESXI_NETWORK=auto           # default — prefers 'VM Network', else first non-mgmt portgroup
 export KEEP_VM=1                   # skip cleanup if you want to inspect
 
 # Point at the .ovf bundle (auto-detects in ./_out/ or current dir)

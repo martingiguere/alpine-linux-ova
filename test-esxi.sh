@@ -20,7 +20,8 @@
 #   ESXI_DATASTORE   — target datastore name, or 'auto' to pick the first one
 #                      with at least MIN_FREE_GIB free space (default: auto)
 #   MIN_FREE_GIB     — free-space threshold for ESXI_DATASTORE=auto (default: 10)
-#   ESXI_NETWORK     — port-group name for VM NIC (default: 'VM Network')
+#   ESXI_NETWORK     — port-group name, or 'auto' to prefer 'VM Network' then
+#                      first non-Management network (default: auto)
 #   TEST_VM_NAME     — VM name on ESXi (default: alpine-ova-test-<pid>)
 #   TEST_HOSTNAME    — hostname cloud-init should set; used as success signal (default: alpine-ovatest)
 #   WAIT_SECONDS     — how long to wait for guest tools + cloud-init (default: 120)
@@ -39,7 +40,7 @@ set -euo pipefail
 : "${ESXI_PASSWORD:?ESXI_PASSWORD must be set}"
 
 : "${ESXI_DATASTORE:=auto}"   # name, or 'auto' to pick first with MIN_FREE_GIB
-: "${ESXI_NETWORK:=VM Network}"
+: "${ESXI_NETWORK:=auto}"     # portgroup name, or 'auto' to prefer 'VM Network'
 : "${TEST_VM_NAME:=alpine-ova-test-$$}"
 : "${TEST_HOSTNAME:=alpine-ovatest}"
 : "${WAIT_SECONDS:=120}"
@@ -149,6 +150,29 @@ if [ "$ESXI_DATASTORE" = "auto" ]; then
     pass "picked datastore '$ESXI_DATASTORE' ($((picked_free / 1024 / 1024 / 1024)) GiB free)"
 fi
 export GOVC_DATASTORE="$ESXI_DATASTORE"
+
+# ---------------------------------------------------------------------------
+# 3c. Network: explicit name, or auto-pick (prefer 'VM Network', else first
+#     non-Management portgroup, else first available).
+# ---------------------------------------------------------------------------
+if [ "$ESXI_NETWORK" = "auto" ]; then
+    log "Auto-selecting VM network…"
+    # govc ls -t Network returns paths like '/ha-datacenter/network/VM Network'.
+    networks=$(govc ls -t Network 2>/dev/null | sed 's|.*/||' || true)
+    [ -n "$networks" ] || fail "no networks visible to govc — check ESXi permissions"
+    picked_net=""
+    # Preference 1: literal 'VM Network'.
+    if printf '%s\n' "$networks" | grep -Fxq 'VM Network'; then
+        picked_net='VM Network'
+    else
+        # Preference 2: first that doesn't look like a Management/vmkernel portgroup.
+        picked_net=$(printf '%s\n' "$networks" | grep -viE 'management|vmkernel|vmotion' | head -1)
+        # Preference 3: fall back to whatever's first.
+        [ -n "$picked_net" ] || picked_net=$(printf '%s\n' "$networks" | head -1)
+    fi
+    ESXI_NETWORK="$picked_net"
+    pass "picked network '$ESXI_NETWORK'"
+fi
 
 if govc vm.info "$TEST_VM_NAME" 2>/dev/null | grep -q '^Name:'; then
     log "Removing pre-existing VM '$TEST_VM_NAME'…"
