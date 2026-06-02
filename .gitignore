@@ -1,0 +1,8 @@
+_out/
+*.qcow2
+*.vmdk
+*.ovf
+*.ova
+*.mf
+SHA256SUMS
+alpine-make-vm-image
