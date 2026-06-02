@@ -1,0 +1,89 @@
+name: build-ova
+
+on:
+  push:
+    branches: [main]
+    paths-ignore: ['**.md', 'LICENSE']
+  pull_request:
+    paths-ignore: ['**.md', 'LICENSE']
+  workflow_dispatch:
+    inputs:
+      output_name:
+        description: 'Output basename (no extension)'
+        type: string
+        default: 'alpine-esxi'
+      alpine_branch:
+        description: 'Alpine branch (e.g. v3.23 or latest-stable)'
+        type: string
+        default: 'v3.23'
+      disk_size_gb:
+        description: 'Image disk size in GiB'
+        type: string
+        default: '20'
+      hw_version:
+        description: 'VMware HW version (vmx-14 = ESXi 6.7 floor)'
+        type: string
+        default: 'vmx-14'
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build Alpine OVA (x86_64)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build prerequisites
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            qemu-utils util-linux rsync curl coreutils dosfstools e2fsprogs
+
+      - name: Show host info (sanity)
+        run: |
+          uname -a
+          qemu-img --version | head -1
+          df -h .
+
+      - name: Run build-ova.sh
+        env:
+          OUTPUT_NAME:   ${{ github.event.inputs.output_name   || 'alpine-esxi' }}
+          ALPINE_BRANCH: ${{ github.event.inputs.alpine_branch || 'v3.23' }}
+          DISK_SIZE_GB:  ${{ github.event.inputs.disk_size_gb  || '20' }}
+          HW_VERSION:    ${{ github.event.inputs.hw_version    || 'vmx-14' }}
+          OUTPUT_DIR:    ${{ github.workspace }}/_out
+        run: |
+          ./build-ova.sh
+          ls -lh _out/
+
+      - name: Sanity-check artifacts
+        run: |
+          cd _out
+          test -s *.ovf
+          test -s *.vmdk
+          test -s *.mf
+          test -s SHA256SUMS
+          # Manifest hashes must match the actual files.
+          while IFS= read -r line; do
+            f="${line#SHA256(}"; f="${f%)=*}"
+            want="${line##* }"
+            got="$(sha256sum "$f" | awk '{print $1}')"
+            [ "$want" = "$got" ] || { echo "manifest mismatch for $f: want=$want got=$got"; exit 1; }
+          done < *.mf
+          # OVF is well-formed XML.
+          sudo apt-get install -y --no-install-recommends libxml2-utils >/dev/null
+          xmllint --noout *.ovf
+          # VMDK is streamOptimized.
+          qemu-img info *.vmdk | grep -E 'file format|cluster_size|create type' || true
+
+      - name: Upload OVA bundle
+        uses: actions/upload-artifact@v4
+        with:
+          name: alpine-ova-${{ github.run_number }}
+          path: _out/*
+          retention-days: 30
+          if-no-files-found: error
