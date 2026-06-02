@@ -86,20 +86,141 @@ fi
 die() { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
 log() { printf '\033[1;34m==>\033[0m %s\n' "$*" >&2; }
 
-for cmd in curl qemu-img qemu-nbd sha1sum sha256sum sudo sfdisk rsync awk sed tar; do
-    command -v "$cmd" >/dev/null 2>&1 || die "missing required tool: $cmd (install qemu-utils + util-linux + rsync + coreutils)"
-done
+# ---------------------------------------------------------------------------
+# Platform + prerequisite detection
+# ---------------------------------------------------------------------------
+# Required commands. Mapped to per-package-manager package names below.
+REQUIRED_CMDS="curl qemu-img qemu-nbd sha1sum sha256sum sudo sfdisk rsync awk sed tar"
+
+detect_platform() {
+    case "$(uname -s)" in
+        Darwin) PLATFORM=macos; PKG_MGR=brew; return ;;
+        Linux)  PLATFORM=linux ;;
+        *)      PLATFORM=unknown; PKG_MGR=unknown; return ;;
+    esac
+    PKG_MGR=unknown
+    if [ -r /etc/os-release ]; then
+        # shellcheck disable=SC1091
+        . /etc/os-release
+        case " ${ID_LIKE:-} ${ID:-} " in
+            *" debian "*|*" ubuntu "*) PKG_MGR=apt ;;
+            *" rhel "*|*" fedora "*|*" centos "*) PKG_MGR=dnf ;;
+        esac
+    fi
+    # Fall back to whichever installer is on PATH.
+    if [ "$PKG_MGR" = unknown ]; then
+        if command -v apt-get >/dev/null 2>&1; then PKG_MGR=apt
+        elif command -v dnf   >/dev/null 2>&1; then PKG_MGR=dnf
+        fi
+    fi
+}
+
+# Map a missing command to its package name for the active package manager.
+pkg_for_cmd() {
+    case "$PKG_MGR:$1" in
+        apt:qemu-img|apt:qemu-nbd)         echo qemu-utils ;;
+        apt:sfdisk)                        echo util-linux ;;
+        apt:sha1sum|apt:sha256sum)         echo coreutils ;;
+        dnf:qemu-img|dnf:qemu-nbd)         echo qemu-img ;;
+        dnf:sfdisk)                        echo util-linux ;;
+        dnf:sha1sum|dnf:sha256sum)         echo coreutils ;;
+        brew:qemu-img|brew:qemu-nbd)       echo qemu ;;
+        brew:sha1sum|brew:sha256sum)       echo coreutils ;;
+        *:*)                               echo "$1" ;;
+    esac
+}
+
+check_prereqs() {
+    detect_platform
+
+    # macOS — fail fast. qemu-nbd needs Linux kernel NBD; no amount of brew helps.
+    if [ "$PLATFORM" = macos ]; then
+        cat >&2 <<'EOF'
+ERROR: macOS is not supported as a build host.
+
+build-ova.sh uses qemu-nbd, which depends on the Linux kernel's NBD driver.
+Even with `brew install qemu` providing qemu-img/qemu-nbd binaries, the kernel
+driver is unavailable on Darwin, so the build cannot complete.
+
+Workarounds (pick one):
+
+  1. GitHub Actions (recommended):
+       Push to GitHub, run on an ubuntu-latest runner. See .github/workflows/.
+
+  2. Docker (Docker Desktop or colima with a privileged Linux container):
+       docker run --rm -it --privileged -v "$PWD:/build" -w /build ubuntu:24.04 \
+         bash -c 'apt-get update && apt-get install -y qemu-utils sudo rsync \
+                   curl sfdisk e2fsprogs && ./build-ova.sh'
+
+  3. A Linux VM (UTM, Multipass, Lima) with qemu-utils installed.
+EOF
+        exit 1
+    fi
+
+    # Linux — collect missing commands.
+    missing=""
+    for cmd in $REQUIRED_CMDS; do
+        command -v "$cmd" >/dev/null 2>&1 || missing="$missing $cmd"
+    done
+
+    # Cross-arch (path C): host arch != target ARCH → need qemu-user-static + binfmt.
+    host_arch="$(uname -m)"
+    cross_pkg=""
+    if [ "$host_arch" != "$ARCH" ]; then
+        if [ ! -e "/proc/sys/fs/binfmt_misc/qemu-${ARCH}" ]; then
+            case "$PKG_MGR" in
+                apt) cross_pkg="qemu-user-static binfmt-support" ;;
+                dnf) cross_pkg="qemu-user-static" ;;
+                *)   cross_pkg="qemu-user-static (and binfmt registration)" ;;
+            esac
+        fi
+    fi
+
+    if [ -n "$missing" ] || [ -n "$cross_pkg" ]; then
+        # Dedupe pkg names.
+        pkgs=""
+        for cmd in $missing; do
+            p="$(pkg_for_cmd "$cmd")"
+            case " $pkgs " in *" $p "*) ;; *) pkgs="$pkgs $p" ;; esac
+        done
+        [ -n "$cross_pkg" ] && pkgs="$pkgs $cross_pkg"
+        pkgs="$(echo "$pkgs" | tr -s ' ' | sed 's/^ *//')"
+
+        case "$PKG_MGR" in
+            apt) install_cmd="sudo apt-get update && sudo apt-get install -y $pkgs" ;;
+            dnf) install_cmd="sudo dnf install -y $pkgs" ;;
+            *)   install_cmd="# install these packages with your package manager: $pkgs" ;;
+        esac
+
+        {
+            printf 'ERROR: build host is not ready.\n\n'
+            [ -n "$missing" ]   && printf '  Missing commands:%s\n' "$missing"
+            [ -n "$cross_pkg" ] && printf '  Cross-build required: host=%s target=%s — need binfmt for qemu-%s\n' "$host_arch" "$ARCH" "$ARCH"
+            printf '\nInstall with (%s):\n  %s\n\n' "${PKG_MGR:-unknown package manager}" "$install_cmd"
+            [ "$PKG_MGR" = unknown ] && printf 'Note: no supported package manager detected (looked for apt-get, dnf).\n      Adapt the package names to your distro.\n\n'
+            [ -n "$cross_pkg" ] && [ "$PKG_MGR" = apt ] && \
+                printf 'After install, register binfmt handlers if not auto-registered:\n  sudo systemctl restart systemd-binfmt   # or: sudo update-binfmts --enable\n\n'
+        } >&2
+        exit 1
+    fi
+
+    # NBD device nodes must be present. Containers without --privileged or
+    # without /dev/nbd* passed through cannot run qemu-nbd.
+    if [ ! -e /dev/nbd0 ]; then
+        if command -v modprobe >/dev/null 2>&1; then
+            log "Loading nbd kernel module (requires sudo)…"
+            sudo modprobe nbd max_part=16 || die "modprobe nbd failed — kernel must have NBD support compiled in"
+        else
+            die "/dev/nbd0 missing and modprobe unavailable. If this is a container, re-run with --privileged and ensure the host has 'nbd' kernel module loaded."
+        fi
+    fi
+}
+
+check_prereqs
 
 [ -f "$TEMPLATE" ]      || die "OVF template not found: $TEMPLATE"
 [ -f "$DEFAULT_SETUP" ] || die "Default setup script not found: $DEFAULT_SETUP"
 [ -z "$CUSTOMIZE_SCRIPT" ] || [ -f "$CUSTOMIZE_SCRIPT" ] || die "CUSTOMIZE_SCRIPT not found: $CUSTOMIZE_SCRIPT"
-
-# nbd module is required by qemu-nbd. alpine-make-vm-image will modprobe it but
-# fail-fast here gives a better error than a 200-line strace later.
-if ! lsmod 2>/dev/null | grep -q '^nbd '; then
-    log "Loading nbd kernel module (requires sudo)…"
-    sudo modprobe nbd max_part=16 || die "modprobe nbd failed — kernel must have NBD support"
-fi
 
 mkdir -p "$OUTPUT_DIR"
 WORK="$(mktemp -d -t build-ova.XXXXXX)"
