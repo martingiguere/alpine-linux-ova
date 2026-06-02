@@ -6,11 +6,29 @@
 # This script handles ESXi/cloud-init wiring and image hygiene that every OVA needs.
 #
 # Environment passed in by build-ova.sh:
+#   EXPECTED_PACKAGES: space-separated apk packages that MUST be installed
+#                     (fails the build hard if any are missing — catches
+#                     alpine-make-vm-image's silent-on-missing-package mode)
 #   CLOUD_INIT       : "1" if cloud-init was installed (enables service + drop-in)
 #   OPEN_VM_TOOLS    : "1" if open-vm-tools was installed (enables service)
 #   KERNEL_CMDLINE   : extra args to append to extlinux default_kernel_opts
 #   ENABLE_NTP       : "1" to enable chronyd
 set -eu
+
+# 0. Verify every expected package made it in. apk silently skipping a missing
+#    package would leave us with a base-only image that imports OK but never
+#    runs cloud-init or open-vm-tools.
+if [ -n "${EXPECTED_PACKAGES:-}" ]; then
+    missing=""
+    for pkg in $EXPECTED_PACKAGES; do
+        apk info -e "$pkg" >/dev/null 2>&1 || missing="$missing $pkg"
+    done
+    if [ -n "$missing" ]; then
+        echo "ERROR: expected packages not installed:$missing" >&2
+        echo "Check the 'Installing additional packages' output above." >&2
+        exit 1
+    fi
+fi
 
 # 1. Kernel command line (eth0 predictability, plus any caller extras).
 #    update-extlinux is the Alpine-native way to regenerate /boot/extlinux.conf.

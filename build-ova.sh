@@ -239,11 +239,15 @@ chmod +x "$AMVI"
 # ---------------------------------------------------------------------------
 # 2. Compose package list and combined chroot script
 # ---------------------------------------------------------------------------
-PACKAGES="chrony curl"
-[ "$INSTALL_CLOUD_INIT" = "1" ]    && PACKAGES="$PACKAGES cloud-init cloud-init-vmware-guestinfo"
-[ "$INSTALL_OPEN_VM_TOOLS" = "1" ] && PACKAGES="$PACKAGES open-vm-tools"
-[ "$INSTALL_NTP" = "1" ]           || PACKAGES="${PACKAGES//chrony/}"
+# Build the package list. Alpine splits OpenRC service files into *-openrc
+# subpackages — if we forget one, the service doesn't exist and our
+# `rc-update add` calls in alpine-image-setup.sh silently no-op.
+PACKAGES="curl"
+[ "$INSTALL_NTP" = "1" ]           && PACKAGES="$PACKAGES chrony chrony-openrc"
+[ "$INSTALL_CLOUD_INIT" = "1" ]    && PACKAGES="$PACKAGES cloud-init cloud-init-openrc cloud-init-datasource-vmware cloud-init-datasource-nocloud"
+[ "$INSTALL_OPEN_VM_TOOLS" = "1" ] && PACKAGES="$PACKAGES open-vm-tools open-vm-tools-openrc open-vm-tools-guestinfo"
 [ -n "$EXTRA_PACKAGES" ]           && PACKAGES="$PACKAGES $EXTRA_PACKAGES"
+EXPECTED_PACKAGES="$PACKAGES"   # captured for post-install verification
 
 # Combine user's customize hook + our default setup into one chroot script.
 # User hook runs first; our setup (cleanup) runs last.
@@ -276,6 +280,7 @@ EOF
 QCOW2="$WORK/${OUTPUT_NAME}.qcow2"
 log "Building qcow2: $QCOW2 (${DISK_SIZE_GB}G, branch $ALPINE_BRANCH, arch $ARCH)"
 sudo env \
+    EXPECTED_PACKAGES="$EXPECTED_PACKAGES" \
     CLOUD_INIT="$INSTALL_CLOUD_INIT" \
     OPEN_VM_TOOLS="$INSTALL_OPEN_VM_TOOLS" \
     ENABLE_NTP="$INSTALL_NTP" \
@@ -295,12 +300,12 @@ sudo env \
 
 sudo chown "$(id -u):$(id -g)" "$QCOW2"
 
-# Sanity: an Alpine base + cloud-init + open-vm-tools install is ≥150 MB
-# uncompressed. Anything tiny means the install silently failed.
+# Sanity: a base + cloud-init + open-vm-tools image is ≥250 MB uncompressed,
+# ≥100 MB qcow2 actual-size. A 2-3 MB image means the install silently failed.
 QCOW_BYTES=$(qemu-img info --output=json "$QCOW2" | awk -F'[ ,:]+' '/"actual-size"/{print $3; exit}')
-MIN_BYTES=$((50 * 1024 * 1024))
+MIN_BYTES=$((100 * 1024 * 1024))
 if [ "${QCOW_BYTES:-0}" -lt "$MIN_BYTES" ]; then
-    die "qcow2 actual-size is $QCOW_BYTES bytes (< 50 MB threshold) — base system install likely failed silently. Check alpine-make-vm-image output above."
+    die "qcow2 actual-size is $QCOW_BYTES bytes (< 100 MB threshold) — install likely failed silently. Check alpine-make-vm-image output above."
 fi
 
 # ---------------------------------------------------------------------------
