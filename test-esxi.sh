@@ -31,9 +31,11 @@
 #   4. Inject guestinfo.metadata into VM extraConfig (govc vm.change, or .vmx
 #      append + vim-cmd reload) — cloud-init's VMware datasource reads it.
 #   5. Power on.
-#   6. Wait for open-vm-tools to report a guest IP.
-#   7. Confirm cloud-init applied the test hostname (proves the datasource
-#      consumed guestinfo).
+#   6. Wait for open-vm-tools to report 'running' (DHCP-independent).
+#   7. PASS when the guest hostname == TEST_HOSTNAME — proves the VMware
+#      datasource consumed guestinfo (read over the backdoor, not the network),
+#      so this holds even with no DHCP. Guest IP is reported if present but is
+#      informational only (a missing IP is a warning, not a failure).
 #   8. Clean up unless KEEP_VM=1.
 #
 # Required env:
@@ -520,34 +522,57 @@ esac
 pass "powered on"
 
 # ---------------------------------------------------------------------------
-# 9. Wait for guest IP (read op — works on free + licensed)
+# 9. Wait for the pass signal: open-vm-tools running + cloud-init hostname.
+#
+# Neither depends on DHCP. open-vm-tools reports guest.hostName (from the guest
+# OS's gethostname()) and toolsRunningStatus over the hypervisor backdoor, not
+# the network. cloud-init's VMware datasource reads guestinfo via vmware-rpctool
+# (also the backdoor), so it applies local-hostname even with no DHCP lease.
+# A matching hostname therefore proves the whole chain: booted → tools up →
+# cloud-init ran → VMware datasource consumed guestinfo → hostname applied.
+#
+# guest.ipAddress IS DHCP-dependent, so it's informational only — reported if
+# present, warned (not failed) if absent.
 # ---------------------------------------------------------------------------
-log "Waiting up to ${WAIT_SECONDS}s for open-vm-tools to report guest IP…"
-guest_ip=$(govc vm.ip -wait "${WAIT_SECONDS}s" "$TEST_VM_NAME" 2>&1 || true)
-if ! [[ "$guest_ip" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-    fail "no guest IP within ${WAIT_SECONDS}s — open-vm-tools didn't start, or DHCP failed. Got: $guest_ip"
-fi
-pass "guest IP: $guest_ip (open-vm-tools is running)"
-
-# ---------------------------------------------------------------------------
-# 10. Verify cloud-init set hostname (proves VMware datasource consumed guestinfo)
-# ---------------------------------------------------------------------------
-log "Verifying cloud-init applied hostname…"
-deadline=$(( $(date +%s) + 60 ))
+log "Waiting up to ${WAIT_SECONDS}s for open-vm-tools + cloud-init hostname…"
+deadline=$(( $(date +%s) + WAIT_SECONDS ))
+tools_ok=0
 got_hostname=""
+guest_ip=""
 while [ "$(date +%s)" -lt "$deadline" ]; do
-    # Targeted path: .virtualMachines[0].guest.hostName.
-    # Both empty and null map to "" via `// ""`.
-    got_hostname=$(govc vm.info -json "$TEST_VM_NAME" 2>/dev/null \
-        | jq -r '.virtualMachines[0].guest.hostName // ""' 2>/dev/null || true)
-    [ "$got_hostname" = "$TEST_HOSTNAME" ] && break
+    guest_json=$(govc vm.info -json "$TEST_VM_NAME" 2>/dev/null \
+        | jq -c '.virtualMachines[0].guest // {}' 2>/dev/null || echo '{}')
+    trs=$(printf '%s' "$guest_json" | jq -r '.toolsRunningStatus // ""')
+    got_hostname=$(printf '%s' "$guest_json" | jq -r '.hostName // ""')
+    guest_ip=$(printf '%s' "$guest_json" | jq -r '.ipAddress // ""')
+    [ "$trs" = "guestToolsRunning" ] && tools_ok=1
+    # Success as soon as tools is up AND hostname matches.
+    if [ "$tools_ok" = "1" ] && [ "$got_hostname" = "$TEST_HOSTNAME" ]; then
+        break
+    fi
     sleep 3
 done
 
+# Gate 1: open-vm-tools must be running (proves the VM booted and the tools
+# package we baked in works). DHCP-independent.
+if [ "$tools_ok" != "1" ]; then
+    fail "open-vm-tools never reported 'guestToolsRunning' within ${WAIT_SECONDS}s — VM didn't boot, or open-vm-tools failed to start."
+fi
+pass "open-vm-tools is running"
+
+# Gate 2 (the real pass criterion): cloud-init applied the hostname.
 if [ "$got_hostname" = "$TEST_HOSTNAME" ]; then
     pass "guest hostname = '$got_hostname' (cloud-init + VMware datasource works)"
 else
     fail "guest hostname is '$got_hostname', expected '$TEST_HOSTNAME' — cloud-init didn't apply guestinfo.metadata"
+fi
+
+# Informational: IP requires DHCP on the chosen portgroup. Not a pass/fail.
+if [[ "$guest_ip" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+    pass "guest IP: $guest_ip"
+else
+    log "NOTE: no IPv4 reported — '$ESXI_NETWORK' likely has no DHCP server. Not a failure; the cloud-init datasource is proven by the hostname above."
+    guest_ip="(none — no DHCP)"
 fi
 
 # ---------------------------------------------------------------------------
@@ -557,7 +582,7 @@ log "All checks passed."
 echo
 echo "  Mode:        $DEPLOY_MODE_RESOLVED"
 echo "  VM:          $TEST_VM_NAME"
+echo "  Hostname:    $got_hostname  (cloud-init applied — pass criterion)"
 echo "  Guest IP:    $guest_ip"
-echo "  Hostname:    $got_hostname"
 echo "  Bundle:      $OVA_DIR/${OVA_NAME}.ovf"
 echo "  Cleanup:     ${KEEP_VM:+SKIPPED (KEEP_VM=1)}${KEEP_VM:-on exit}"

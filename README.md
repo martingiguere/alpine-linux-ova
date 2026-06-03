@@ -168,9 +168,17 @@ Pass criteria:
 1. Local manifest hashes match the actual files.
 2. govc can authenticate; target type + inventory resolved.
 3. OVF deploys without error.
-4. VM powers on and reports a guest IP within `WAIT_SECONDS` (120s default).
-5. Guest hostname (via VMware tools) matches `TEST_HOSTNAME` — confirms the
-   VMware cloud-init datasource read guestinfo and cloud-init applied it.
+4. VM powers on and open-vm-tools reports `guestToolsRunning` within
+   `WAIT_SECONDS` (120s default).
+5. **Guest hostname (via VMware tools) matches `TEST_HOSTNAME`** — the pass
+   criterion. Confirms the VMware cloud-init datasource read guestinfo (over
+   the hypervisor backdoor, not the network) and cloud-init applied it.
+
+The guest **IP is informational, not a pass requirement**. `hostName` and
+`toolsRunningStatus` are reported by open-vm-tools independently of networking,
+and the VMware datasource reads guestinfo via `vmware-rpctool` (backdoor), so
+the test passes even on a portgroup with no DHCP server. If no IPv4 appears
+within the window the script logs a note and continues — it does not fail.
 
 > **Note for vCenter targets:** the script deploys a real VM into the cluster
 > (unique `alpine-ova-test-<pid>` name) and destroys it on exit. On a shared/
