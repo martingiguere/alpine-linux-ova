@@ -91,7 +91,32 @@ trap cleanup EXIT INT TERM
 # 1. Pre-flight
 # ---------------------------------------------------------------------------
 command -v govc >/dev/null 2>&1 || fail "govc not on PATH (install: https://github.com/vmware/govmomi/releases)"
+command -v jq   >/dev/null 2>&1 || fail "jq not on PATH (apt install jq / brew install jq)"
 command -v base64 >/dev/null 2>&1 || fail "base64 not on PATH"
+
+if ! command -v ovftool >/dev/null 2>&1; then
+    cat >&2 <<'EOF'
+ERROR: 'ovftool' not found on this workstation.
+
+ovftool is required to deploy OVAs to ESXi. govc's import.ovf hits a license
+gate on free-edition / unlicensed ESXi hosts; ovftool can deploy against
+those when run from the ESXi shell itself (see Lam's workaround).
+
+  Get it from Broadcom (free, account registration required):
+    https://developer.broadcom.com/tools/open-virtualization-format-ovf-tool/latest
+    Look for the bundle matching your OS, e.g.:
+        VMware-ovftool-4.6.3-24031167-lin.x86_64.zip       (Linux)
+        VMware-ovftool-4.6.3-24031167-mac.x64.zip          (macOS)
+
+  Or pull from the rgl/ovftool-binaries community mirror:
+    curl -fsSL -o /tmp/ovftool.zip \
+      https://github.com/rgl/ovftool-binaries/raw/main/archive/VMware-ovftool-4.6.3-24031167-lin.x86_64.zip
+    unzip /tmp/ovftool.zip -d "$HOME/.local/"
+    export PATH="$HOME/.local/ovftool:$PATH"
+    ovftool --version
+EOF
+    exit 1
+fi
 
 [ -f "$OVF_FILE" ] || fail "OVF not found: $OVF_FILE"
 [ -f "$MF_FILE" ]  || fail "Manifest not found: $MF_FILE"
@@ -182,15 +207,23 @@ if govc vm.info "$TEST_VM_NAME" 2>/dev/null | grep -q '^Name:'; then
 fi
 
 # ---------------------------------------------------------------------------
-# 4. Import OVF
+# 4. Import OVF via ovftool
 # ---------------------------------------------------------------------------
-log "Importing OVF (this can take a minute on slower datastores)…"
-# Build the network map override on the fly: every Network in the OVF -> ESXI_NETWORK.
-# Without -options the import would prompt for network mapping.
-spec=$(govc import.spec "$OVF_FILE" \
-    | jq --arg net "$ESXI_NETWORK" --arg name "$TEST_VM_NAME" \
-        '.Name = $name | .DiskProvisioning = "thin" | .NetworkMapping[].Network = $net')
-echo "$spec" | govc import.ovf -options=- -name="$TEST_VM_NAME" "$OVF_FILE" >/dev/null
+log "Importing OVF via ovftool (this can take a minute on slower datastores)…"
+# URI-encode the password (chars like '!', '@', '/', ':' are reserved in
+# vi:// URLs). jq's @uri does RFC 3986 percent-encoding.
+pw_enc=$(printf '%s' "$ESXI_PASSWORD" | jq -sRr @uri)
+ovftool \
+    --datastore="$ESXI_DATASTORE" \
+    --diskMode=thin \
+    --name="$TEST_VM_NAME" \
+    --network="$ESXI_NETWORK" \
+    --noSSLVerify \
+    --acceptAllEulas \
+    --skipManifestCheck \
+    --X:logLevel=info \
+    "$OVF_FILE" \
+    "vi://${ESXI_USER}:${pw_enc}@${ESXI_HOST}" >/dev/null
 pass "imported as '$TEST_VM_NAME'"
 
 # ---------------------------------------------------------------------------
