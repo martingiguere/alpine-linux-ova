@@ -112,39 +112,52 @@ terraform's `vsphere_virtual_machine`). Both base64 and gzip+base64 encodings
 are honored via the corresponding `.encoding` keys, which are declared as
 `ovf:userConfigurable="true"` properties in the OVF.
 
-## Testing on a real ESXi host
+## Testing on a real ESXi host or vCenter
 
-`test-esxi.sh` uploads an OVA bundle to an ESXi host, injects cloud-init
-guestinfo, powers the VM on, and verifies that open-vm-tools reports a guest IP
-and that cloud-init applied the requested hostname (proves the VMware
-datasource is wired correctly end-to-end). Cleans up after itself.
+`test-esxi.sh` deploys an OVA bundle, injects cloud-init guestinfo, powers the
+VM on, and verifies that open-vm-tools reports a guest IP and that cloud-init
+applied the requested hostname (proves the VMware datasource is wired correctly
+end-to-end). Cleans up after itself.
 
-**Deploy mode**: ovftool is uploaded to the ESXi datastore and run *on the host*
-(targeting `vi://...@localhost`). This is William Lam's well-known workaround
-that lets OVA deploy work on free-license ESXi — the standard `govc import.ovf`
-path is blocked there. Licensed ESXi works the same way.
+It auto-detects the target and picks a deploy path:
 
-The first run uploads ovftool to `/vmfs/volumes/<datastore>/vmware-ovftool/`
-(one-time, ~30 MB); subsequent runs detect the cached copy and skip the upload.
+| Target | `DEPLOY_MODE` | How it deploys |
+|---|---|---|
+| **vCenter** | `govc` (forced) | ovftool from the workstation → `vi://…@vcenter/<datacenter>/host/<cluster>/`; `govc` for power/guestinfo/destroy |
+| **Licensed standalone ESXi** | `govc` | ovftool from the workstation → `vi://…@host`; `govc` for the rest |
+| **Free / unlicensed ESXi** | `ssh` | ovftool uploaded to the datastore and run *on the host* (`vi://…@localhost`, the William Lam workaround — the SOAP write API is gated on free); `vim-cmd` for power/destroy |
 
-**Workstation prerequisites** (all on PATH): `govc`, `jq`, `base64`, `ssh`,
-`sshpass`, and one of:
-- `ovftool` installed system-wide (Broadcom bundle or the rgl/ovftool-binaries
-  mirror), **or**
-- `OVFTOOL_DIR` env var pointing at an unpacked ovftool tree, **or**
+`DEPLOY_MODE=auto` (default) probes the target. vCenter → `govc`. Standalone
+ESXi → a no-op write probe: license error → `ssh`, else → `govc`. Override with
+`DEPLOY_MODE=govc|ssh`.
+
+**Auto-detected** (override any via env):
+- target type (standalone ESXi vs vCenter)
+- on vCenter: datacenter, cluster, resource pool, ovftool inventory locator
+- datastore: prefers **shared** storage (mounted by >1 host) with the most free
+  space, so a clustered VM isn't pinned to a single host's local disk
+- network: prefers `VM Network`, else the first non-management portgroup
+
+**Workstation prerequisites** (all on PATH): `govc`, `jq`, `base64`. For the
+`ssh` path also `ssh` + `sshpass`. ovftool is needed for `govc` mode (and for
+the first `ssh`-mode upload) — provide it via one of:
+- `ovftool` on PATH (Broadcom bundle or the rgl/ovftool-binaries mirror), or
+- `OVFTOOL_DIR` pointing at an unpacked ovftool tree, or
 - a `./ovftool/` directory next to the script.
 
-(If ESXi already has the cached copy from a prior run, no local ovftool is
-needed.)
+(In `ssh` mode, once ESXi has the cached copy from a prior run, no local
+ovftool is needed.)
 
 ```sh
-export ESXI_HOST=esxi.lan          # or IP
-export ESXI_USER=root
+export ESXI_HOST=vcenter.lan       # ESXi host OR vCenter
+export ESXI_USER=administrator@vsphere.local   # 'root' for standalone ESXi
 export ESXI_PASSWORD=…
 # Optional:
-export ESXI_DATASTORE=auto         # default — picks first datastore with ≥10 GiB free
-export MIN_FREE_GIB=10             # threshold for ESXI_DATASTORE=auto
-export ESXI_NETWORK=auto           # default — prefers 'VM Network', else first non-mgmt portgroup
+export DEPLOY_MODE=auto            # auto | govc | ssh
+export ESXI_DATASTORE=auto         # or a name; auto prefers shared, most-free
+export MIN_FREE_GIB=10
+export ESXI_NETWORK=auto           # or a portgroup name
+export GOVC_DATACENTER=…           # vCenter only; auto-detected if unset
 export KEEP_VM=1                   # skip cleanup if you want to inspect
 
 # Point at the .ovf bundle (auto-detects in ./_out/ or current dir)
@@ -153,8 +166,13 @@ export KEEP_VM=1                   # skip cleanup if you want to inspect
 
 Pass criteria:
 1. Local manifest hashes match the actual files.
-2. govc can authenticate.
-3. OVF imports without error.
+2. govc can authenticate; target type + inventory resolved.
+3. OVF deploys without error.
 4. VM powers on and reports a guest IP within `WAIT_SECONDS` (120s default).
 5. Guest hostname (via VMware tools) matches `TEST_HOSTNAME` — confirms the
    VMware cloud-init datasource read guestinfo and cloud-init applied it.
+
+> **Note for vCenter targets:** the script deploys a real VM into the cluster
+> (unique `alpine-ova-test-<pid>` name) and destroys it on exit. On a shared/
+> production vCenter, run deliberately — set `KEEP_VM=1` to inspect, or
+> `TEST_VM_NAME=…` to control naming.

@@ -1,35 +1,45 @@
 #!/usr/bin/env bash
 # test-esxi.sh — Upload an OVA bundle to ESXi/vCenter and verify cloud-init works.
 #
-# Reusable test harness for any OVA produced by build-ova.sh. Supports both
-# licensed and free-license ESXi hosts via two deploy paths picked at runtime:
+# Reusable test harness for any OVA produced by build-ova.sh. Works against a
+# standalone ESXi host (licensed OR free) and against vCenter, auto-detecting
+# the target and choosing a deploy path at runtime:
 #
-#   DEPLOY_MODE=govc   Licensed ESXi / vCenter: ovftool from this workstation
-#                      targeting the remote host, govc for vm.change/power/destroy.
-#                      Fast.
-#   DEPLOY_MODE=ssh    Free / unlicensed ESXi (SOAP write API gated by the
-#                      license): scp ovftool to the host once (cached on the
-#                      datastore), run via SSH targeting localhost, use vim-cmd
-#                      for power/destroy. Slower (requires SCP of ovftool the
-#                      first time, ~30 MB).
-#   DEPLOY_MODE=auto   (default) Probe a no-op SOAP write call; license error
-#                      → ssh, anything else → govc.
+#   DEPLOY_MODE=govc   vCenter, or licensed standalone ESXi: ovftool from this
+#                      workstation targeting the remote endpoint, govc for
+#                      vm.change/power/destroy. Fast. (Forced for vCenter.)
+#   DEPLOY_MODE=ssh    Free / unlicensed standalone ESXi (SOAP write API gated
+#                      by the license): scp ovftool to the host once (cached on
+#                      the datastore), run via SSH targeting localhost, use
+#                      vim-cmd for power/destroy. NOT valid for vCenter.
+#   DEPLOY_MODE=auto   (default) vCenter → govc. Standalone ESXi → probe a
+#                      no-op SOAP write call: license error → ssh, else → govc.
 #
-# Pipeline (identical for both modes):
+# What gets auto-detected (override any via env):
+#   • target type (standalone ESXi vs vCenter) via about.apiType
+#   • on vCenter: datacenter, cluster, resource pool, and the ovftool
+#     inventory locator path
+#   • datastore: prefers SHARED storage (mounted by >1 host) with the most
+#     free space, so clustered VMs aren't pinned to one host
+#   • network: prefers 'VM Network', else first non-management portgroup
+#
+# Pipeline:
 #   1. Verify the local .ovf/.vmdk/.mf bundle against its manifest.
-#   2. Auto-pick datastore + network (override with env).
-#   3. Deploy via ovftool with cloud-init metadata baked in as
-#      --prop:guestinfo.metadata=<base64>. This avoids a separate vm.change
-#      call (also gated on free).
-#   4. Power on.
-#   5. Wait for open-vm-tools to report a guest IP.
-#   6. Confirm cloud-init applied the test hostname (proves the VMware
-#      datasource consumed guestinfo).
-#   7. Clean up unless KEEP_VM=1.
+#   2. Detect target + auto-pick datacenter/cluster/datastore/network.
+#   3. Deploy via ovftool (govc mode: from workstation, with a vCenter
+#      inventory locator when applicable; ssh mode: on the ESXi shell).
+#   4. Inject guestinfo.metadata into VM extraConfig (govc vm.change, or .vmx
+#      append + vim-cmd reload) — cloud-init's VMware datasource reads it.
+#   5. Power on.
+#   6. Wait for open-vm-tools to report a guest IP.
+#   7. Confirm cloud-init applied the test hostname (proves the datasource
+#      consumed guestinfo).
+#   8. Clean up unless KEEP_VM=1.
 #
 # Required env:
-#   ESXI_HOST        — hostname or IP (no scheme), e.g. 192.168.1.55
-#   ESXI_USER        — username (typically 'root')
+#   ESXI_HOST        — hostname or IP of ESXi OR vCenter (no scheme)
+#   ESXI_USER        — username ('root' for ESXi, 'administrator@vsphere.local'
+#                      for vCenter SSO — the '@' is handled automatically)
 #   ESXI_PASSWORD    — password
 #
 # Optional env (with defaults):
@@ -45,6 +55,7 @@
 #   KEEP_VM          — set to 1 to skip cleanup                         (unset)
 #   GOVC_INSECURE    — passed to govc                                   (1)
 #   OVFTOOL_DIR      — override location of local ovftool install dir   (unset)
+#   GOVC_DATACENTER  — vCenter datacenter name                          (auto)
 #
 # Exit: 0 = pass, non-zero = fail.
 
@@ -174,34 +185,86 @@ done < "$MF_FILE"
 pass "manifest verified"
 
 # ---------------------------------------------------------------------------
-# 3. Connect + auto-pick datastore / network (works for both modes)
+# 3. Connect + detect target type (standalone ESXi vs vCenter)
 # ---------------------------------------------------------------------------
-log "Probing ESXi connectivity…"
-govc about >/dev/null || fail "govc cannot connect to $ESXI_HOST"
-pass "connected to $ESXI_HOST"
+log "Probing connectivity…"
+about_json=$(govc about -json 2>/dev/null) || fail "govc cannot connect to $ESXI_HOST"
+api_type=$(printf '%s' "$about_json" | jq -r '.about.apiType // empty')
+product=$(printf '%s' "$about_json" | jq -r '.about.fullName // empty')
 
+# IS_VCENTER drives inventory handling: vCenter has datacenters/clusters and
+# needs an inventory locator path for ovftool; standalone ESXi (HostAgent)
+# does not. ESXI_HOST/USER/PASSWORD naming is kept for compatibility but the
+# target may be either.
+IS_VCENTER=0
+[ "$api_type" = "VirtualCenter" ] && IS_VCENTER=1
+if [ "$IS_VCENTER" = "1" ]; then
+    pass "connected: $product (vCenter)"
+else
+    pass "connected: $product (standalone ESXi)"
+fi
+
+# ---------------------------------------------------------------------------
+# 3a. vCenter: auto-detect datacenter + cluster + resource pool.
+#     These disambiguate govc calls (vCenter has multiple of everything) and
+#     build the ovftool inventory locator.
+# ---------------------------------------------------------------------------
+VI_LOCATOR=""        # appended to vi:// for ovftool on vCenter
+if [ "$IS_VCENTER" = "1" ]; then
+    # Datacenter — explicit override or first one found.
+    if [ -z "${GOVC_DATACENTER:-}" ]; then
+        GOVC_DATACENTER=$(govc datacenter.info -json 2>/dev/null | jq -r '.datacenters[0].name // empty')
+        [ -n "$GOVC_DATACENTER" ] || fail "no datacenter found on vCenter"
+    fi
+    export GOVC_DATACENTER
+    # Cluster (first compute resource in the datacenter).
+    cluster_path=$(govc find "/$GOVC_DATACENTER/host" -type c 2>/dev/null | head -1)
+    [ -n "$cluster_path" ] || cluster_path=$(govc find / -type c 2>/dev/null | head -1)
+    [ -n "$cluster_path" ] || fail "no cluster found on vCenter"
+    cluster_name="${cluster_path##*/}"
+    # Resource pool for the cluster, for govc placement.
+    export GOVC_RESOURCE_POOL="${cluster_path}/Resources"
+    # ovftool locator: vi://…@vcenter/<datacenter>/host/<cluster>/
+    # With DRS the cluster's root pool auto-places the VM on a host.
+    VI_LOCATOR="/${GOVC_DATACENTER}/host/${cluster_name}/"
+    pass "datacenter '$GOVC_DATACENTER', cluster '$cluster_name'"
+fi
+
+# ---------------------------------------------------------------------------
+# 3b. Auto-pick datastore.
+#     On a cluster, prefer SHARED storage (mounted by >1 host) so the VM
+#     isn't pinned to one host; among candidates, pick the most free space.
+#     Standalone ESXi has only host-local datastores, so the same logic
+#     gracefully picks the emptiest one.
+# ---------------------------------------------------------------------------
 if [ "$ESXI_DATASTORE" = "auto" ]; then
-    log "Auto-selecting datastore with ≥${MIN_FREE_GIB} GiB free…"
+    log "Auto-selecting datastore with ≥${MIN_FREE_GIB} GiB free (preferring shared)…"
     min_bytes=$((MIN_FREE_GIB * 1024 * 1024 * 1024))
-    picked=""; picked_free=""
-    while IFS=$'\t' read -r ds_name free; do
-        [ -z "$ds_name" ] && continue
-        if [ "$free" -ge "$min_bytes" ] 2>/dev/null; then
-            picked="$ds_name"; picked_free="$free"
-            break
-        fi
-    done < <(govc datastore.info -json 2>/dev/null \
-        | jq -r '.datastores[] | "\(.info.name)\t\(.info.freeSpace)"')
-    if [ -z "$picked" ]; then
+    # Emit: hostcount<TAB>freeSpace<TAB>name, accessible+VMFS/NFS only.
+    # Sort shared-first (hostcount desc) then most-free (freeSpace desc).
+    ds_line=$(govc datastore.info -json 2>/dev/null \
+        | jq -r '.datastores[]
+                 | select((.summary.accessible // true) == true)
+                 | "\(.host|length)\t\(.info.freeSpace)\t\(.info.name)"' \
+        | awk -F'\t' -v min="$min_bytes" '$2+0 >= min' \
+        | sort -t$'\t' -k1,1nr -k2,2nr \
+        | head -1)
+    if [ -z "$ds_line" ]; then
         log "No datastore had ≥${MIN_FREE_GIB} GiB free. Available:"
         govc datastore.info 2>&1 | grep -E 'Name:|Free:' | sed 's/^/  /' >&2
         fail "Set ESXI_DATASTORE=<name> explicitly, or lower MIN_FREE_GIB."
     fi
-    ESXI_DATASTORE="$picked"
-    pass "picked datastore '$ESXI_DATASTORE' ($((picked_free / 1024 / 1024 / 1024)) GiB free)"
+    ds_hosts=$(printf '%s' "$ds_line" | cut -f1)
+    ds_free=$(printf '%s' "$ds_line" | cut -f2)
+    ESXI_DATASTORE=$(printf '%s' "$ds_line" | cut -f3-)
+    shared_note="local"; [ "$ds_hosts" -gt 1 ] 2>/dev/null && shared_note="shared across $ds_hosts hosts"
+    pass "picked datastore '$ESXI_DATASTORE' ($((ds_free / 1024 / 1024 / 1024)) GiB free, $shared_note)"
 fi
 export GOVC_DATASTORE="$ESXI_DATASTORE"
 
+# ---------------------------------------------------------------------------
+# 3c. Auto-pick network.
+# ---------------------------------------------------------------------------
 if [ "$ESXI_NETWORK" = "auto" ]; then
     log "Auto-selecting VM network…"
     networks=$(govc find -type n 2>/dev/null | sed 's|.*/||' || true)
@@ -219,26 +282,36 @@ fi
 # 4. Deploy mode detection
 # ---------------------------------------------------------------------------
 if [ "$DEPLOY_MODE" = "auto" ]; then
-    log "Probing SOAP write capability to choose deploy mode…"
-    # datastore.rm on a nonexistent path hits the license gate BEFORE the
-    # existence check on free ESXi (file ops are write-API methods). On
-    # licensed hosts, it returns 'file not found' or similar. This is the
-    # most reliable probe; vm.power and vm.destroy short-circuit on
-    # 'vm not found' before reaching the license check.
-    probe_err=$(govc datastore.rm "__esxi_mode_probe_nonexistent__" 2>&1 || true)
-    case "$probe_err" in
-        *license*|*License*)
-            DEPLOY_MODE_RESOLVED=ssh
-            pass "probe: license-gated host detected → DEPLOY_MODE=ssh"
-            ;;
-        *)
-            DEPLOY_MODE_RESOLVED=govc
-            pass "probe: SOAP writes allowed → DEPLOY_MODE=govc"
-            ;;
-    esac
+    if [ "$IS_VCENTER" = "1" ]; then
+        # vCenter always has the full write API, and you can't run ovftool on
+        # the vCenter appliance via SSH the way you can on an ESXi shell.
+        DEPLOY_MODE_RESOLVED=govc
+        pass "target is vCenter → DEPLOY_MODE=govc"
+    else
+        log "Probing SOAP write capability to choose deploy mode…"
+        # datastore.rm on a nonexistent path hits the license gate BEFORE the
+        # existence check on free ESXi (file ops are write-API methods). On
+        # licensed hosts, it returns 'file not found' or similar. This is the
+        # most reliable probe; vm.power and vm.destroy short-circuit on
+        # 'vm not found' before reaching the license check.
+        probe_err=$(govc datastore.rm "__esxi_mode_probe_nonexistent__" 2>&1 || true)
+        case "$probe_err" in
+            *license*|*License*)
+                DEPLOY_MODE_RESOLVED=ssh
+                pass "probe: license-gated host detected → DEPLOY_MODE=ssh"
+                ;;
+            *)
+                DEPLOY_MODE_RESOLVED=govc
+                pass "probe: SOAP writes allowed → DEPLOY_MODE=govc"
+                ;;
+        esac
+    fi
 else
     DEPLOY_MODE_RESOLVED="$DEPLOY_MODE"
     log "DEPLOY_MODE=$DEPLOY_MODE_RESOLVED (explicit)"
+    if [ "$DEPLOY_MODE_RESOLVED" = "ssh" ] && [ "$IS_VCENTER" = "1" ]; then
+        fail "DEPLOY_MODE=ssh is not supported against vCenter (no ESXi shell). Use govc, or point ESXI_HOST at a standalone ESXi host."
+    fi
 fi
 
 if [ "$DEPLOY_MODE_RESOLVED" = "ssh" ]; then
@@ -272,7 +345,12 @@ metadata=$(printf '%s\n' \
     "    eth0:" \
     "      dhcp4: true")
 METADATA_B64=$(printf '%s' "$metadata" | base64 -w0 2>/dev/null || printf '%s' "$metadata" | base64)
-PW_ENC=$(printf '%s' "$ESXI_PASSWORD" | jq -sRr @uri)
+# URI-encode BOTH user and password for the vi:// URL. The username matters
+# for vCenter SSO accounts like 'administrator@vsphere.local' — the literal
+# '@' (and '\' in 'DOMAIN\user') would otherwise be mis-parsed as the
+# user↔host separator. jq @uri does RFC 3986 percent-encoding.
+USER_ENC=$(printf '%s' "$ESXI_USER"     | jq -sRr @uri)
+PW_ENC=$(printf '%s'   "$ESXI_PASSWORD" | jq -sRr @uri)
 
 # ---------------------------------------------------------------------------
 # 6. Idempotent cleanup of stale VM
@@ -320,10 +398,13 @@ OVFTOOL_FLAGS=(
 if [ "$DEPLOY_MODE_RESOLVED" = "govc" ]; then
     # GOVC mode: run ovftool from workstation, talking to remote ESXi/vCenter.
     [ -n "$OVFTOOL_LOCAL_DIR" ] || fail "ovftool required locally for DEPLOY_MODE=govc"
-    log "Deploying via local ovftool → ${ESXI_HOST}…"
+    # Target URL: encoded user + password, plus an inventory locator path on
+    # vCenter (datacenter/host/cluster). Standalone ESXi needs no locator.
+    VI_TARGET="vi://${USER_ENC}:${PW_ENC}@${ESXI_HOST}${VI_LOCATOR}"
+    log "Deploying via local ovftool → ${ESXI_HOST}${VI_LOCATOR}…"
     "$OVFTOOL_LOCAL_DIR/ovftool" "${OVFTOOL_FLAGS[@]}" \
         "$OVF_FILE" \
-        "vi://${ESXI_USER}:${PW_ENC}@${ESXI_HOST}" >/dev/null
+        "$VI_TARGET" >/dev/null
     pass "imported as '$TEST_VM_NAME'"
 else
     # SSH mode: ensure ovftool is on the host (cached or freshly uploaded),
@@ -388,7 +469,7 @@ EOF
     for flag in "${OVFTOOL_FLAGS[@]}"; do
         remote_cmd="$remote_cmd '$flag'"
     done
-    remote_cmd="$remote_cmd '${STAGE_REMOTE_DIR}/${OVA_NAME}.ovf' 'vi://${ESXI_USER}:${PW_ENC}@localhost'"
+    remote_cmd="$remote_cmd '${STAGE_REMOTE_DIR}/${OVA_NAME}.ovf' 'vi://${USER_ENC}:${PW_ENC}@localhost'"
     ssh_esxi "$remote_cmd" >/dev/null
 
     ssh_esxi "rm -rf '$STAGE_REMOTE_DIR'" >/dev/null 2>&1 || true
