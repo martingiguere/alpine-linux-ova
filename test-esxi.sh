@@ -83,6 +83,10 @@ cleanup() {
     log "Cleaning up VM '$TEST_VM_NAME'…"
     govc vm.power -off -force "$TEST_VM_NAME" >/dev/null 2>&1 || true
     govc vm.destroy "$TEST_VM_NAME" >/dev/null 2>&1 || true
+    # Datastore staging dir (set later if we get past the SSH section)
+    if [ -n "${STAGE_REMOTE_DIR:-}" ]; then
+        ssh_esxi "rm -rf '$STAGE_REMOTE_DIR'" 2>/dev/null || true
+    fi
     exit "$rc"
 }
 trap cleanup EXIT INT TERM
@@ -93,29 +97,24 @@ trap cleanup EXIT INT TERM
 command -v govc >/dev/null 2>&1 || fail "govc not on PATH (install: https://github.com/vmware/govmomi/releases)"
 command -v jq   >/dev/null 2>&1 || fail "jq not on PATH (apt install jq / brew install jq)"
 command -v base64 >/dev/null 2>&1 || fail "base64 not on PATH"
+command -v ssh  >/dev/null 2>&1 || fail "ssh not on PATH"
+command -v sshpass >/dev/null 2>&1 || fail "sshpass not on PATH (apt install sshpass / brew install hudochenkov/sshpass/sshpass)"
 
-if ! command -v ovftool >/dev/null 2>&1; then
-    cat >&2 <<'EOF'
-ERROR: 'ovftool' not found on this workstation.
-
-ovftool is required to deploy OVAs to ESXi. govc's import.ovf hits a license
-gate on free-edition / unlicensed ESXi hosts; ovftool can deploy against
-those when run from the ESXi shell itself (see Lam's workaround).
-
-  Get it from Broadcom (free, account registration required):
-    https://developer.broadcom.com/tools/open-virtualization-format-ovf-tool/latest
-    Look for the bundle matching your OS, e.g.:
-        VMware-ovftool-4.6.3-24031167-lin.x86_64.zip       (Linux)
-        VMware-ovftool-4.6.3-24031167-mac.x64.zip          (macOS)
-
-  Or pull from the rgl/ovftool-binaries community mirror:
-    curl -fsSL -o /tmp/ovftool.zip \
-      https://github.com/rgl/ovftool-binaries/raw/main/archive/VMware-ovftool-4.6.3-24031167-lin.x86_64.zip
-    unzip /tmp/ovftool.zip -d "$HOME/.local/"
-    export PATH="$HOME/.local/ovftool:$PATH"
-    ovftool --version
-EOF
-    exit 1
+# Local ovftool: ESXi may already have a cached copy at
+# /vmfs/volumes/<ds>/vmware-ovftool/ — we'll check there first and only
+# need a local source if ESXi doesn't have one. Resolution order:
+#   1. $OVFTOOL_DIR (explicit override)
+#   2. ./ovftool/   (project-local bundled copy)
+#   3. dirname of the binary on PATH (system install root)
+# OVFTOOL_LOCAL_DIR remains empty if none is found; we'll re-check ESXi
+# before complaining.
+OVFTOOL_LOCAL_DIR=""
+if [ -n "${OVFTOOL_DIR:-}" ] && [ -x "$OVFTOOL_DIR/ovftool" ]; then
+    OVFTOOL_LOCAL_DIR="$OVFTOOL_DIR"
+elif [ -x "./ovftool/ovftool" ]; then
+    OVFTOOL_LOCAL_DIR="$(cd ./ovftool && pwd)"
+elif command -v ovftool >/dev/null 2>&1; then
+    OVFTOOL_LOCAL_DIR="$(dirname "$(readlink -f "$(command -v ovftool)")")"
 fi
 
 [ -f "$OVF_FILE" ] || fail "OVF not found: $OVF_FILE"
@@ -207,23 +206,99 @@ if govc vm.info "$TEST_VM_NAME" 2>/dev/null | grep -q '^Name:'; then
 fi
 
 # ---------------------------------------------------------------------------
-# 4. Import OVF via ovftool
+# 4. Import OVF via ovftool running ON ESXi (works on free + licensed alike).
 # ---------------------------------------------------------------------------
-log "Importing OVF via ovftool (this can take a minute on slower datastores)…"
-# URI-encode the password (chars like '!', '@', '/', ':' are reserved in
-# vi:// URLs). jq's @uri does RFC 3986 percent-encoding.
+# Helper: run a command on the ESXi shell via sshpass+ssh.
+ssh_esxi() {
+    SSHPASS="$ESXI_PASSWORD" sshpass -e ssh \
+        -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+        -o LogLevel=ERROR \
+        "${ESXI_USER}@${ESXI_HOST}" "$@"
+}
+
+OVFTOOL_REMOTE_DIR="/vmfs/volumes/${ESXI_DATASTORE}/vmware-ovftool"
+STAGE_REMOTE_DIR="/vmfs/volumes/${ESXI_DATASTORE}/.ova-stage-${TEST_VM_NAME}"
+
+# 4a. Cache check: does ESXi already have ovftool?
+log "Checking for cached ovftool on ESXi at ${OVFTOOL_REMOTE_DIR}/ovftool…"
+if ssh_esxi "[ -x ${OVFTOOL_REMOTE_DIR}/ovftool ]" 2>/dev/null; then
+    pass "ovftool already present on ESXi (cached)"
+else
+    log "Not present — need to upload from this workstation."
+    if [ -z "$OVFTOOL_LOCAL_DIR" ]; then
+        cat >&2 <<'EOF'
+ERROR: ESXi has no cached ovftool, and none is available locally to upload.
+
+Set one up locally (any of these works), then re-run this script. The first
+run uploads it to the ESXi datastore; subsequent runs reuse the cached copy.
+
+  Get it from Broadcom (free, account registration required):
+    https://developer.broadcom.com/tools/open-virtualization-format-ovf-tool/latest
+    Look for the bundle matching your OS, e.g.:
+        VMware-ovftool-4.6.3-24031167-lin.x86_64.zip       (Linux)
+        VMware-ovftool-4.6.3-24031167-mac.x64.zip          (macOS)
+
+  Or pull from the rgl/ovftool-binaries community mirror:
+    curl -fsSL -o /tmp/ovftool.zip \
+      https://github.com/rgl/ovftool-binaries/raw/main/archive/VMware-ovftool-4.6.3-24031167-lin.x86_64.zip
+    unzip /tmp/ovftool.zip -d "$HOME/.local/"
+    export PATH="$HOME/.local/ovftool:$PATH"
+    ovftool --version
+
+Or point the script at an unpacked tree:
+    OVFTOOL_DIR=/path/to/vmware-ovftool ./test-esxi.sh
+EOF
+        exit 1
+    fi
+    log "Uploading ovftool from $OVFTOOL_LOCAL_DIR → ${OVFTOOL_REMOTE_DIR}/"
+    ssh_esxi "mkdir -p '$OVFTOOL_REMOTE_DIR'"
+    # Upload every file in the install dir, preserving relative paths.
+    cd "$OVFTOOL_LOCAL_DIR"
+    file_count=$(find . -type f | wc -l)
+    i=0
+    find . -type f | while IFS= read -r f; do
+        rel="${f#./}"
+        i=$((i + 1))
+        printf '\r  [%d/%d] %s' "$i" "$file_count" "$rel" >&2
+        govc datastore.upload "$rel" "vmware-ovftool/$rel" >/dev/null
+    done
+    printf '\n' >&2
+    # Mark the wrapper + binary executable; patch shebang from bash to sh
+    # (ESXi shell doesn't have bash).
+    ssh_esxi "chmod +x '${OVFTOOL_REMOTE_DIR}/ovftool' '${OVFTOOL_REMOTE_DIR}/ovftool.bin' 2>/dev/null; \
+              sed -i '1s|^#!/bin/bash|#!/bin/sh|' '${OVFTOOL_REMOTE_DIR}/ovftool' 2>/dev/null; \
+              true"
+    cd - >/dev/null
+    pass "ovftool uploaded and patched (cached for next time)"
+fi
+
+# 4b. Upload the OVA bundle to a staging dir on the datastore.
+log "Uploading OVA bundle to ESXi staging dir…"
+ssh_esxi "mkdir -p '$STAGE_REMOTE_DIR'"
+stage_rel=".ova-stage-${TEST_VM_NAME}"
+for f in "${OVA_NAME}.ovf" "${OVA_NAME}.mf" "${OVA_NAME}-disk1.vmdk"; do
+    govc datastore.upload "$OVA_DIR/$f" "$stage_rel/$f" >/dev/null
+done
+pass "bundle staged at $STAGE_REMOTE_DIR"
+
+# 4c. Run ovftool ON ESXi targeting localhost.
+# URI-encode the password (chars like '!' '@' '/' ':' are reserved in vi:// URLs).
 pw_enc=$(printf '%s' "$ESXI_PASSWORD" | jq -sRr @uri)
-ovftool \
-    --datastore="$ESXI_DATASTORE" \
+log "Deploying via ovftool (running on ESXi, target=localhost)…"
+ssh_esxi "${OVFTOOL_REMOTE_DIR}/ovftool \
+    --datastore='${ESXI_DATASTORE}' \
     --diskMode=thin \
-    --name="$TEST_VM_NAME" \
-    --network="$ESXI_NETWORK" \
+    --name='${TEST_VM_NAME}' \
+    --network='${ESXI_NETWORK}' \
     --noSSLVerify \
     --acceptAllEulas \
     --skipManifestCheck \
-    --X:logLevel=info \
-    "$OVF_FILE" \
-    "vi://${ESXI_USER}:${pw_enc}@${ESXI_HOST}" >/dev/null
+    '${STAGE_REMOTE_DIR}/${OVA_NAME}.ovf' \
+    'vi://${ESXI_USER}:${pw_enc}@localhost'" >/dev/null
+
+# Clean up staging files (datastore.rm is blocked on free ESXi, so use ssh).
+ssh_esxi "rm -rf '$STAGE_REMOTE_DIR'" || true
+
 pass "imported as '$TEST_VM_NAME'"
 
 # ---------------------------------------------------------------------------

@@ -119,7 +119,23 @@ guestinfo, powers the VM on, and verifies that open-vm-tools reports a guest IP
 and that cloud-init applied the requested hostname (proves the VMware
 datasource is wired correctly end-to-end). Cleans up after itself.
 
-Requires `govc` and `jq` on PATH.
+**Deploy mode**: ovftool is uploaded to the ESXi datastore and run *on the host*
+(targeting `vi://...@localhost`). This is William Lam's well-known workaround
+that lets OVA deploy work on free-license ESXi — the standard `govc import.ovf`
+path is blocked there. Licensed ESXi works the same way.
+
+The first run uploads ovftool to `/vmfs/volumes/<datastore>/vmware-ovftool/`
+(one-time, ~30 MB); subsequent runs detect the cached copy and skip the upload.
+
+**Workstation prerequisites** (all on PATH): `govc`, `jq`, `base64`, `ssh`,
+`sshpass`, and one of:
+- `ovftool` installed system-wide (Broadcom bundle or the rgl/ovftool-binaries
+  mirror), **or**
+- `OVFTOOL_DIR` env var pointing at an unpacked ovftool tree, **or**
+- a `./ovftool/` directory next to the script.
+
+(If ESXi already has the cached copy from a prior run, no local ovftool is
+needed.)
 
 ```sh
 export ESXI_HOST=esxi.lan          # or IP
