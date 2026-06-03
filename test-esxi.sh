@@ -120,26 +120,26 @@ cleanup() {
     rc=$?
     if [ "${KEEP_VM:-0}" = "1" ]; then
         log "KEEP_VM=1 — leaving VM '$TEST_VM_NAME' on $ESXI_HOST for inspection."
-        return
+    else
+        log "Cleaning up VM '$TEST_VM_NAME'…"
+        case "$DEPLOY_MODE_RESOLVED" in
+            govc)
+                govc vm.power -off -force "$TEST_VM_NAME" >/dev/null 2>&1 || true
+                govc vm.destroy "$TEST_VM_NAME" >/dev/null 2>&1 || true
+                ;;
+            ssh)
+                vmid=$(get_vmid "$TEST_VM_NAME" 2>/dev/null || true)
+                if [ -n "$vmid" ]; then
+                    ssh_esxi "vim-cmd vmsvc/power.off $vmid 2>/dev/null; \
+                              vim-cmd vmsvc/unregister $vmid 2>/dev/null" >/dev/null || true
+                fi
+                ssh_esxi "rm -rf /vmfs/volumes/${ESXI_DATASTORE}/${TEST_VM_NAME}" 2>/dev/null || true
+                if [ -n "$STAGE_REMOTE_DIR" ]; then
+                    ssh_esxi "rm -rf '$STAGE_REMOTE_DIR'" 2>/dev/null || true
+                fi
+                ;;
+        esac
     fi
-    log "Cleaning up VM '$TEST_VM_NAME'…"
-    case "$DEPLOY_MODE_RESOLVED" in
-        govc)
-            govc vm.power -off -force "$TEST_VM_NAME" >/dev/null 2>&1 || true
-            govc vm.destroy "$TEST_VM_NAME" >/dev/null 2>&1 || true
-            ;;
-        ssh)
-            vmid=$(get_vmid "$TEST_VM_NAME" 2>/dev/null || true)
-            if [ -n "$vmid" ]; then
-                ssh_esxi "vim-cmd vmsvc/power.off $vmid 2>/dev/null; \
-                          vim-cmd vmsvc/unregister $vmid 2>/dev/null" >/dev/null || true
-            fi
-            ssh_esxi "rm -rf /vmfs/volumes/${ESXI_DATASTORE}/${TEST_VM_NAME}" 2>/dev/null || true
-            if [ -n "$STAGE_REMOTE_DIR" ]; then
-                ssh_esxi "rm -rf '$STAGE_REMOTE_DIR'" 2>/dev/null || true
-            fi
-            ;;
-    esac
     exit "$rc"
 }
 trap cleanup EXIT INT TERM
@@ -147,14 +147,10 @@ trap cleanup EXIT INT TERM
 # ---------------------------------------------------------------------------
 # 1. Pre-flight tool check
 # ---------------------------------------------------------------------------
-command -v govc    >/dev/null 2>&1 || fail "govc not on PATH (install: https://github.com/vmware/govmomi/releases)"
-command -v jq      >/dev/null 2>&1 || fail "jq not on PATH (apt install jq / brew install jq)"
-command -v base64  >/dev/null 2>&1 || fail "base64 not on PATH"
-command -v ovftool >/dev/null 2>&1 || \
-    [ -n "${OVFTOOL_DIR:-}" ] && [ -x "$OVFTOOL_DIR/ovftool" ] || \
-    [ -x "./ovftool/ovftool" ] || \
-    fail "ovftool not found (PATH, OVFTOOL_DIR, or ./ovftool/). See README for install instructions."
-# ssh+sshpass only required if we end up in ssh mode; check after detection.
+command -v govc   >/dev/null 2>&1 || fail "govc not on PATH (install: https://github.com/vmware/govmomi/releases)"
+command -v jq     >/dev/null 2>&1 || fail "jq not on PATH (apt install jq / brew install jq)"
+command -v base64 >/dev/null 2>&1 || fail "base64 not on PATH"
+# ovftool, ssh, sshpass are mode-specific — checked after DEPLOY_MODE is resolved.
 
 [ -f "$OVF_FILE" ] || fail "OVF not found: $OVF_FILE"
 [ -f "$MF_FILE" ]  || fail "Manifest not found: $MF_FILE"
@@ -259,6 +255,9 @@ elif [ -x "./ovftool/ovftool" ]; then
     OVFTOOL_LOCAL_DIR="$(cd ./ovftool && pwd)"
 elif command -v ovftool >/dev/null 2>&1; then
     OVFTOOL_LOCAL_DIR="$(dirname "$(readlink -f "$(command -v ovftool)")")"
+fi
+if [ "$DEPLOY_MODE_RESOLVED" = "govc" ] && [ -z "$OVFTOOL_LOCAL_DIR" ]; then
+    fail "ovftool not found (PATH, OVFTOOL_DIR, or ./ovftool/) — required for DEPLOY_MODE=govc"
 fi
 
 # ---------------------------------------------------------------------------
