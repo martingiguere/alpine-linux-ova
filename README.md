@@ -1,6 +1,26 @@
-# build-ova.sh — generic Alpine OVA builder
+# alpine-linux-ova — generic Alpine OVA builder for ESXi / vCenter
 
-Builds a thin, ESXi 6.7+ compatible OVA bundle from upstream Alpine packages.
+Builds a thin, ESXi 6.7+ compatible OVA bundle from upstream Alpine packages
+(`build-ova.sh`), and ships a test harness that deploys + validates it against
+real ESXi or vCenter (`test-esxi.sh`).
+
+## Prebuilt downloads (releases)
+
+Each `v*` tag publishes a built, verified OVA bundle as a
+[GitHub Release](https://github.com/martingiguere/alpine-linux-ova/releases)
+asset (built reproducibly from the tagged source by `.github/workflows/release.yml`).
+
+```sh
+# Download the latest release bundle with the GitHub CLI:
+gh release download --repo martingiguere/alpine-linux-ova --pattern '*'
+
+# Verify integrity:
+sha256sum -c SHA256SUMS
+```
+
+Each release attaches `alpine-esxi-<tag>.ovf`, `alpine-esxi-<tag>-disk1.vmdk`
+(streamOptimized), `alpine-esxi-<tag>.mf`, and `SHA256SUMS`. Cut a new release
+by tagging: `git tag v0.1.0 && git push --tags`.
 
 ## Output
 

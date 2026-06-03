@@ -1,0 +1,69 @@
+name: release-ova
+
+# Build the OVA from the tagged source and publish it as a GitHub Release
+# asset. Fires on any v* tag (e.g. v0.1.0).
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write        # needed to create the release + upload assets
+
+jobs:
+  release:
+    name: Build + publish OVA for ${{ github.ref_name }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build prerequisites
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            qemu-utils util-linux rsync curl coreutils dosfstools e2fsprogs libxml2-utils
+
+      - name: Build OVA
+        env:
+          # Version the filenames so assets from different releases don't collide.
+          OUTPUT_NAME: alpine-esxi-${{ github.ref_name }}
+          ALPINE_BRANCH: v3.23
+          DISK_SIZE_GB: '20'
+          HW_VERSION: vmx-14
+          OUTPUT_DIR: ${{ github.workspace }}/_out
+        run: |
+          ./build-ova.sh
+          ls -lh _out/
+
+      - name: Verify artifacts (manifest + OVF well-formed + streamOptimized)
+        run: |
+          cd _out
+          while IFS= read -r line; do
+            f="${line#SHA256(}"; f="${f%)=*}"
+            want="${line##* }"
+            got="$(sha256sum "$f" | awk '{print $1}')"
+            [ "$want" = "$got" ] || { echo "manifest mismatch for $f"; exit 1; }
+          done < *.mf
+          xmllint --noout *.ovf
+          qemu-img info ./*-disk1.vmdk | grep -q 'streamOptimized' || { echo "VMDK not streamOptimized"; exit 1; }
+
+      - name: Publish GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "${{ github.ref_name }}" \
+            --title "Alpine OVA ${{ github.ref_name }}" \
+            --notes "Generic Alpine Linux ${{ '3.23' }} OVA for ESXi 6.7+ / vCenter (BIOS, vmx-14, pvscsi, vmxnet3, streamOptimized VMDK, cloud-init via the VMware datasource).
+
+          Built reproducibly from this tag by \`build-ova.sh\`. Verify downloads against \`SHA256SUMS\`.
+
+          Files:
+          - \`alpine-esxi-${{ github.ref_name }}.ovf\` — OVF 1.0 descriptor
+          - \`alpine-esxi-${{ github.ref_name }}-disk1.vmdk\` — streamOptimized (thin) disk
+          - \`alpine-esxi-${{ github.ref_name }}.mf\` — SHA-256 manifest (ovftool/govc validate this on import)
+          - \`SHA256SUMS\` — transport checksums" \
+            _out/alpine-esxi-*.ovf \
+            _out/alpine-esxi-*-disk1.vmdk \
+            _out/alpine-esxi-*.mf \
+            _out/SHA256SUMS
