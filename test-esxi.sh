@@ -5,13 +5,14 @@
 # standalone ESXi host (licensed OR free) and against vCenter, auto-detecting
 # the target and choosing a deploy path at runtime:
 #
-#   DEPLOY_MODE=govc   vCenter, or licensed standalone ESXi: ovftool from this
-#                      workstation targeting the remote endpoint, govc for
+#   DEPLOY_MODE=govc   vCenter, or licensed standalone ESXi: deploy with
+#                      `govc import.ovf` (native, no ovftool), govc for
 #                      vm.change/power/destroy. Fast. (Forced for vCenter.)
 #   DEPLOY_MODE=ssh    Free / unlicensed standalone ESXi (SOAP write API gated
 #                      by the license): scp ovftool to the host once (cached on
 #                      the datastore), run via SSH targeting localhost, use
-#                      vim-cmd for power/destroy. NOT valid for vCenter.
+#                      vim-cmd for power/destroy. NOT valid for vCenter. This is
+#                      the only path that uses ovftool.
 #   DEPLOY_MODE=auto   (default) vCenter → govc. Standalone ESXi → probe a
 #                      no-op SOAP write call: license error → ssh, else → govc.
 #
@@ -26,8 +27,8 @@
 # Pipeline:
 #   1. Verify the local .ovf/.vmdk/.mf bundle against its manifest.
 #   2. Detect target + auto-pick datacenter/cluster/datastore/network.
-#   3. Deploy via ovftool (govc mode: from workstation, with a vCenter
-#      inventory locator when applicable; ssh mode: on the ESXi shell).
+#   3. Deploy (govc mode: `govc import.ovf` natively; ssh mode: ovftool on
+#      the ESXi shell, the free-license workaround).
 #   4. Inject guestinfo.metadata into VM extraConfig (govc vm.change, or .vmx
 #      append + vim-cmd reload) — cloud-init's VMware datasource reads it.
 #   5. Power on.
@@ -124,13 +125,35 @@ get_vmid() {
     ssh_esxi "vim-cmd vmsvc/getallvms 2>/dev/null | awk '/[[:space:]]$1[[:space:]]/ {print \$1; exit}'"
 }
 
+# Run "$@" with ESXi-host-name → IP resolution (from vCenter inventory) applied,
+# WITHOUT touching the real /etc/hosts. When RESOLVE_HOSTS_FILE is set (section
+# 3a decided the names don't resolve here), re-exec inside a private mount+user
+# namespace and bind our hosts file over /etc/hosts there; the mapping is only
+# visible to this command. Otherwise run the command unchanged.
+run_with_host_resolution() {
+    if [ -n "${RESOLVE_HOSTS_FILE:-}" ]; then
+        # Single-quoted on purpose: $1/$@ must expand in the INNER shell,
+        # after the namespace + bind-mount are set up.
+        # shellcheck disable=SC2016
+        unshare -m -r sh -c '
+            mount --bind "$1" /etc/hosts || exit 97
+            shift
+            exec "$@"
+        ' _ "$RESOLVE_HOSTS_FILE" "$@"
+    else
+        "$@"
+    fi
+}
+
 # Mode-dispatching cleanup. Both branches are idempotent and safe to call
 # on a half-failed deploy.
 DEPLOY_MODE_RESOLVED=""
 STAGE_REMOTE_DIR=""
+RESOLVE_HOSTS_FILE=""
 
 cleanup() {
     rc=$?
+    if [ -n "$RESOLVE_HOSTS_FILE" ]; then rm -f "$RESOLVE_HOSTS_FILE" 2>/dev/null || true; fi
     if [ "${KEEP_VM:-0}" = "1" ]; then
         log "KEEP_VM=1 — leaving VM '$TEST_VM_NAME' on $ESXI_HOST for inspection."
     else
@@ -209,9 +232,8 @@ fi
 # ---------------------------------------------------------------------------
 # 3a. vCenter: auto-detect datacenter + cluster + resource pool.
 #     These disambiguate govc calls (vCenter has multiple of everything) and
-#     build the ovftool inventory locator.
+#     give `govc import.ovf` its placement target via GOVC_RESOURCE_POOL.
 # ---------------------------------------------------------------------------
-VI_LOCATOR=""        # appended to vi:// for ovftool on vCenter
 if [ "$IS_VCENTER" = "1" ]; then
     # Datacenter — explicit override or first one found.
     if [ -z "${GOVC_DATACENTER:-}" ]; then
@@ -224,12 +246,51 @@ if [ "$IS_VCENTER" = "1" ]; then
     [ -n "$cluster_path" ] || cluster_path=$(govc find / -type c 2>/dev/null | head -1)
     [ -n "$cluster_path" ] || fail "no cluster found on vCenter"
     cluster_name="${cluster_path##*/}"
-    # Resource pool for the cluster, for govc placement.
+    # Resource pool for the cluster — govc import.ovf places the VM here. With
+    # DRS the cluster's root pool auto-selects a host.
     export GOVC_RESOURCE_POOL="${cluster_path}/Resources"
-    # ovftool locator: vi://…@vcenter/<datacenter>/host/<cluster>/
-    # With DRS the cluster's root pool auto-places the VM on a host.
-    VI_LOCATOR="/${GOVC_DATACENTER}/host/${cluster_name}/"
     pass "datacenter '$GOVC_DATACENTER', cluster '$cluster_name'"
+
+    # --- NFC host resolution -------------------------------------------------
+    # The OVA disk upload (NFC) does NOT go through vCenter — vCenter redirects
+    # it straight to the owning ESXi host, addressed by the host's registered
+    # name (often an internal FQDN). If this workstation can't resolve that
+    # name, the upload fails. We resolve every cluster host's name to its
+    # management IP *from vCenter inventory* and, only if a name doesn't
+    # already resolve here, run the import inside a private mount namespace
+    # with a bind-mounted hosts file. The real /etc/hosts is never modified.
+    NEED_NS_RESOLVE=0
+    RESOLVE_HOSTS_FILE=""
+    host_map=""        # "<ip> <name>" lines
+    while IFS= read -r h; do
+        [ -z "$h" ] && continue
+        hn="${h##*/}"
+        hip=$(govc host.info -host "$h" -json 2>/dev/null \
+            | jq -r '.hostSystems[0].config.network.vnic[]?.spec.ip.ipAddress // empty' 2>/dev/null | head -1)
+        [ -n "$hip" ] || continue
+        host_map="${host_map}${hip} ${hn}"$'\n'
+        # Does this name already resolve on the workstation?
+        if ! getent hosts "$hn" >/dev/null 2>&1; then
+            NEED_NS_RESOLVE=1
+        fi
+    done < <(govc find "$cluster_path" -type h 2>/dev/null)
+
+    if [ "$NEED_NS_RESOLVE" = "1" ]; then
+        if unshare -m -r true 2>/dev/null; then
+            RESOLVE_HOSTS_FILE=$(mktemp -t esxi-hosts.XXXXXX)
+            cat /etc/hosts > "$RESOLVE_HOSTS_FILE" 2>/dev/null || true
+            printf '\n# ESXi cluster hosts (resolved from vCenter, for NFC upload)\n%s' "$host_map" >> "$RESOLVE_HOSTS_FILE"
+            log "Some ESXi host names don't resolve here; import will run in a"
+            log "  private mount namespace with vCenter-resolved IPs (real"
+            log "  /etc/hosts untouched):"
+            printf '%s' "$host_map" | sed 's/^/    /' >&2
+        else
+            log "WARNING: ESXi host names don't resolve here and a private mount"
+            log "  namespace isn't available — the NFC disk upload may fail."
+            log "  Resolved mapping (add to DNS or run from a host that resolves these):"
+            printf '%s' "$host_map" | sed 's/^/    /' >&2
+        fi
+    fi
 fi
 
 # ---------------------------------------------------------------------------
@@ -321,18 +382,18 @@ if [ "$DEPLOY_MODE_RESOLVED" = "ssh" ]; then
     command -v sshpass >/dev/null 2>&1 || fail "sshpass not on PATH (apt install sshpass / brew install hudochenkov/sshpass/sshpass)"
 fi
 
-# Resolve local ovftool install dir (for both modes; in ssh mode we may not
-# need it if ESXi already has a cached copy).
+# Resolve local ovftool install dir — only the ssh path uses ovftool (and only
+# for the first upload; thereafter it's cached on the ESXi datastore). The govc
+# path deploys with `govc import.ovf` and needs no ovftool at all.
 OVFTOOL_LOCAL_DIR=""
-if [ -n "${OVFTOOL_DIR:-}" ] && [ -x "$OVFTOOL_DIR/ovftool" ]; then
-    OVFTOOL_LOCAL_DIR="$OVFTOOL_DIR"
-elif [ -x "./ovftool/ovftool" ]; then
-    OVFTOOL_LOCAL_DIR="$(cd ./ovftool && pwd)"
-elif command -v ovftool >/dev/null 2>&1; then
-    OVFTOOL_LOCAL_DIR="$(dirname "$(readlink -f "$(command -v ovftool)")")"
-fi
-if [ "$DEPLOY_MODE_RESOLVED" = "govc" ] && [ -z "$OVFTOOL_LOCAL_DIR" ]; then
-    fail "ovftool not found (PATH, OVFTOOL_DIR, or ./ovftool/) — required for DEPLOY_MODE=govc"
+if [ "$DEPLOY_MODE_RESOLVED" = "ssh" ]; then
+    if [ -n "${OVFTOOL_DIR:-}" ] && [ -x "$OVFTOOL_DIR/ovftool" ]; then
+        OVFTOOL_LOCAL_DIR="$OVFTOOL_DIR"
+    elif [ -x "./ovftool/ovftool" ]; then
+        OVFTOOL_LOCAL_DIR="$(cd ./ovftool && pwd)"
+    elif command -v ovftool >/dev/null 2>&1; then
+        OVFTOOL_LOCAL_DIR="$(dirname "$(readlink -f "$(command -v ovftool)")")"
+    fi
 fi
 
 # ---------------------------------------------------------------------------
@@ -398,15 +459,29 @@ OVFTOOL_FLAGS=(
 )
 
 if [ "$DEPLOY_MODE_RESOLVED" = "govc" ]; then
-    # GOVC mode: run ovftool from workstation, talking to remote ESXi/vCenter.
-    [ -n "$OVFTOOL_LOCAL_DIR" ] || fail "ovftool required locally for DEPLOY_MODE=govc"
-    # Target URL: encoded user + password, plus an inventory locator path on
-    # vCenter (datacenter/host/cluster). Standalone ESXi needs no locator.
-    VI_TARGET="vi://${USER_ENC}:${PW_ENC}@${ESXI_HOST}${VI_LOCATOR}"
-    log "Deploying via local ovftool → ${ESXI_HOST}${VI_LOCATOR}…"
-    "$OVFTOOL_LOCAL_DIR/ovftool" "${OVFTOOL_FLAGS[@]}" \
-        "$OVF_FILE" \
-        "$VI_TARGET" >/dev/null
+    # GOVC mode: deploy natively with `govc import.ovf` — no ovftool needed.
+    # The SOAP write API is open on licensed ESXi / vCenter. Placement comes
+    # from GOVC_DATACENTER / GOVC_RESOURCE_POOL / GOVC_DATASTORE (set above);
+    # govc is a single static binary that runs on any arch.
+    #
+    # The options spec sets thin provisioning and maps every OVF network to
+    # the chosen portgroup. We deliberately leave guestinfo PropertyMapping
+    # empty here — those become OVF-environment properties, which cloud-init's
+    # VMware datasource does NOT read; the extraConfig keys set by the
+    # vm.change step below are what it consumes.
+    log "Deploying via govc import.ovf → ${ESXI_HOST} (dc=${GOVC_DATACENTER:-n/a})…"
+    deploy_opts=$(mktemp -t import-options.XXXXXX.json)
+    govc import.spec "$OVF_FILE" \
+        | jq --arg net "$ESXI_NETWORK" '
+            .DiskProvisioning = "thin"
+            | .NetworkMapping = ((.NetworkMapping // []) | map(.Network = $net))
+            | .PowerOn = false' \
+        > "$deploy_opts"
+    # The disk-upload (NFC) connects to the owning ESXi host directly; run it
+    # with ESXi-host-name resolution if those names don't resolve here (see 3a).
+    run_with_host_resolution \
+        govc import.ovf -name="$TEST_VM_NAME" -options="$deploy_opts" "$OVF_FILE" >/dev/null
+    rm -f "$deploy_opts"
     pass "imported as '$TEST_VM_NAME'"
 else
     # SSH mode: ensure ovftool is on the host (cached or freshly uploaded),

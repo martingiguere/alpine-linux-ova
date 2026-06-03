@@ -123,9 +123,9 @@ It auto-detects the target and picks a deploy path:
 
 | Target | `DEPLOY_MODE` | How it deploys |
 |---|---|---|
-| **vCenter** | `govc` (forced) | ovftool from the workstation → `vi://…@vcenter/<datacenter>/host/<cluster>/`; `govc` for power/guestinfo/destroy |
-| **Licensed standalone ESXi** | `govc` | ovftool from the workstation → `vi://…@host`; `govc` for the rest |
-| **Free / unlicensed ESXi** | `ssh` | ovftool uploaded to the datastore and run *on the host* (`vi://…@localhost`, the William Lam workaround — the SOAP write API is gated on free); `vim-cmd` for power/destroy |
+| **vCenter** | `govc` (forced) | `govc import.ovf` (native, placed via the detected datacenter/cluster/resource pool); `govc` for power/guestinfo/destroy |
+| **Licensed standalone ESXi** | `govc` | `govc import.ovf`; `govc` for the rest |
+| **Free / unlicensed ESXi** | `ssh` | ovftool uploaded to the datastore and run *on the host* (`vi://…@localhost`, the William Lam workaround — the SOAP write API is gated on free); `vim-cmd` for power/destroy. **The only path that uses ovftool.** |
 
 `DEPLOY_MODE=auto` (default) probes the target. vCenter → `govc`. Standalone
 ESXi → a no-op write probe: license error → `ssh`, else → `govc`. Override with
@@ -138,15 +138,18 @@ ESXi → a no-op write probe: license error → `ssh`, else → `govc`. Override
   space, so a clustered VM isn't pinned to a single host's local disk
 - network: prefers `VM Network`, else the first non-management portgroup
 
-**Workstation prerequisites** (all on PATH): `govc`, `jq`, `base64`. For the
-`ssh` path also `ssh` + `sshpass`. ovftool is needed for `govc` mode (and for
-the first `ssh`-mode upload) — provide it via one of:
+**Workstation prerequisites** (all on PATH): `govc`, `jq`, `base64`. The `govc`
+path (vCenter / licensed ESXi) needs nothing else — `govc import.ovf` does the
+deploy natively, so it runs on any architecture.
+
+The `ssh` path (free ESXi) additionally needs `ssh` + `sshpass`, and ovftool to
+upload to the host on first use — provide it via one of:
 - `ovftool` on PATH (Broadcom bundle or the rgl/ovftool-binaries mirror), or
 - `OVFTOOL_DIR` pointing at an unpacked ovftool tree, or
 - a `./ovftool/` directory next to the script.
 
-(In `ssh` mode, once ESXi has the cached copy from a prior run, no local
-ovftool is needed.)
+(Once ESXi has the cached copy from a prior `ssh`-mode run, no local ovftool is
+needed.)
 
 ```sh
 export ESXI_HOST=vcenter.lan       # ESXi host OR vCenter
