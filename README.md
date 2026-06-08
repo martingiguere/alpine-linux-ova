@@ -67,6 +67,7 @@ See `./build-ova.sh -h` for the full env-var list.
 |---|---|
 | `cloud-init` + `cloud-init-vmware-guestinfo` | Reads `guestinfo.{metadata,userdata}` at first boot via the VMware datasource |
 | `open-vm-tools` | Required by the VMware datasource (`vmware-rpctool`/`vmtoolsd`); also gives vSphere guest IP / graceful shutdown |
+| `open-vm-tools-vix` | VIX plugin — enables vSphere Guest Operations API (`govc guest.run`, `guest.start`, file transfer) without ssh. Without this plugin loaded, vCenter reports "guest operations agent is out of date" even though `vmtoolsd` reports `guestToolsRunning`. |
 | `chrony` | NTP — K8s and TLS hate clock skew |
 | `curl` | Useful for inside-VM debugging |
 

@@ -245,7 +245,7 @@ chmod +x "$AMVI"
 PACKAGES="curl"
 [ "$INSTALL_NTP" = "1" ]           && PACKAGES="$PACKAGES chrony chrony-openrc"
 [ "$INSTALL_CLOUD_INIT" = "1" ]    && PACKAGES="$PACKAGES cloud-init cloud-init-openrc cloud-init-datasource-vmware cloud-init-datasource-nocloud"
-[ "$INSTALL_OPEN_VM_TOOLS" = "1" ] && PACKAGES="$PACKAGES open-vm-tools open-vm-tools-openrc open-vm-tools-guestinfo"
+[ "$INSTALL_OPEN_VM_TOOLS" = "1" ] && PACKAGES="$PACKAGES open-vm-tools open-vm-tools-openrc open-vm-tools-guestinfo open-vm-tools-vix"
 [ -n "$EXTRA_PACKAGES" ]           && PACKAGES="$PACKAGES $EXTRA_PACKAGES"
 EXPECTED_PACKAGES="$PACKAGES"   # captured for post-install verification
 
