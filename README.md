@@ -68,10 +68,11 @@ See `./build-ova.sh -h` for the full env-var list.
 | `cloud-init` + `cloud-init-vmware-guestinfo` | Reads `guestinfo.{metadata,userdata}` at first boot via the VMware datasource |
 | `open-vm-tools` | Required by the VMware datasource (`vmware-rpctool`/`vmtoolsd`); also gives vSphere guest IP / graceful shutdown |
 | `open-vm-tools-vix` | VIX plugin — enables vSphere Guest Operations API (`govc guest.run`, `guest.start`, file transfer) without ssh. Without this plugin loaded, vCenter reports "guest operations agent is out of date" even though `vmtoolsd` reports `guestToolsRunning`. |
+| `openssh` + `openssh-server-openrc` | sshd is enabled at boot but the image ships **no credentials** (root password locked, no host keys baked in, no `authorized_keys`). sshd listens on first boot and `ssh-keygen -A` regenerates fresh host keys, but no one can log in until cloud-init injects credentials via `chpasswd` or `ssh_authorized_keys`. Makes post-deploy administration trivial without changing the "no shipped credentials" posture. |
 | `chrony` | NTP — K8s and TLS hate clock skew |
 | `curl` | Useful for inside-VM debugging |
 
-Disable any of these with `INSTALL_CLOUD_INIT=0`, `INSTALL_OPEN_VM_TOOLS=0`, `INSTALL_NTP=0`.
+Disable any of these with `INSTALL_CLOUD_INIT=0`, `INSTALL_OPEN_VM_TOOLS=0`, `INSTALL_OPENSSH=0`, `INSTALL_NTP=0`.
 
 ## What gets removed at the end of the build
 

@@ -81,8 +81,16 @@ EOF
 rc-update add networking default 2>/dev/null || true
 rc-update add hostname default 2>/dev/null || true
 
-# 6. SSH explicitly NOT enabled by default. If sshd is installed, leave it off;
-#    operators add their own access. Spec §7 anti-requirement.
+# 6. SSH: enable sshd at boot when openssh is installed. The OVA still ships
+#    with root locked (no password), no host keys (regenerated on first boot
+#    via openssh-server-openrc's `ssh-keygen -A`), and AuthorizedKeysFile
+#    defaults — so sshd is listening but cannot grant access until cloud-init
+#    injects credentials (chpasswd or ssh_authorized_keys). This makes
+#    post-deploy admin trivial without changing the "no shipped credentials"
+#    posture. Set INSTALL_OPENSSH=0 at build time to omit the package entirely.
+if [ "${OPENSSH:-0}" = "1" ] && [ -f /etc/init.d/sshd ]; then
+    rc-update add sshd default 2>/dev/null || true
+fi
 
 # 7. Hygiene — clear build-time state so each clone gets fresh identity.
 #    Cloud-init regenerates SSH host keys, machine-id, and consumes its own state.
